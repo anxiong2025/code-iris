@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iris-core",
+    "crates/iris-llm",
+    "crates/iris-tui",
+    "crates/iris-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["anxiong2025"]
+repository = "https://github.com/anxiong2025/code-iris"
+description = "See through your code — Rust-powered architecture analyzer & AI agent"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "signal"] }
+async-stream = "0.3"
+futures = "0.3"
+
+# HTTP & networking (rustls — no OpenSSL dependency)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Code analysis
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+
+# Syntax highlighting
+syntect = "5"
+
+# Environment & config
+dotenvy = "0.15"
+dirs = "6"
+
+# Security
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+glob = "0.3"
+
+# Internal crates
+iris-core = { path = "crates/iris-core" }
+iris-llm = { path = "crates/iris-llm" }

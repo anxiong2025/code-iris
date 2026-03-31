@@ -1,0 +1,37 @@
+[package]
+name = "iris-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal UI for code-iris — Ratatui-based Claude Code-style interface"
+
+[[bin]]
+name = "code-iris"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui.workspace = true
+crossterm.workspace = true
+
+# Async
+tokio.workspace = true
+futures.workspace = true
+
+# Directories
+dirs.workspace = true
+
+# Environment
+dotenvy.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Internal
+iris-core.workspace = true
+iris-llm.workspace = true
