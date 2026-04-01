@@ -33,12 +33,33 @@ pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use iris_llm::ToolDefinition;
 use serde_json::Value;
+
+/// Shared working-directory reference — injected into tools that do I/O.
+///
+/// When `None`, tools use the process's current working directory.
+/// Set via `Agent::set_cwd()` or the `/cd` slash command.
+pub type CwdRef = Arc<Mutex<Option<PathBuf>>>;
+
+/// Resolve `path` relative to `cwd` (if it is not already absolute).
+pub fn resolve_path(path: &str, cwd: &CwdRef) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_absolute() {
+        return p;
+    }
+    if let Some(ref base) = *cwd.lock().unwrap() {
+        return base.join(p);
+    }
+    p
+}
+
+// ── Tool trait ────────────────────────────────────────────────────────────────
 
 /// A single agent tool.
 #[async_trait]
@@ -48,6 +69,8 @@ pub trait Tool: Send + Sync {
     fn input_schema(&self) -> Value;
     async fn execute(&self, input: Value) -> Result<String>;
 }
+
+// ── Tool registry ─────────────────────────────────────────────────────────────
 
 /// Registry of all available tools.
 #[derive(Default)]
@@ -85,18 +108,21 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Full registry including AgentTool (for top-level agents).
+    /// Full registry including AgentTool.
     ///
-    /// Reads `ANTHROPIC_API_KEY` from the environment for AgentTool.
-    pub fn default_registry() -> Self {
-        let store = TaskStore::new();
+    /// - `session_id` enables task persistence.
+    /// - `cwd` is a shared working-directory reference injected into all I/O tools.
+    pub fn default_registry_for(session_id: Option<&str>, cwd: CwdRef) -> Self {
+        let store = session_id
+            .and_then(|id| TaskStore::for_session(id).ok())
+            .unwrap_or_default();
         let mut r = Self::new();
-        r.register(Arc::new(BashTool));
-        r.register(Arc::new(FileReadTool));
-        r.register(Arc::new(FileWriteTool));
-        r.register(Arc::new(FileEditTool));
-        r.register(Arc::new(GrepTool));
-        r.register(Arc::new(GlobTool));
+        r.register(Arc::new(BashTool::new(cwd.clone())));
+        r.register(Arc::new(FileReadTool::new(cwd.clone())));
+        r.register(Arc::new(FileWriteTool::new(cwd.clone())));
+        r.register(Arc::new(FileEditTool::new(cwd.clone())));
+        r.register(Arc::new(GrepTool::new(cwd.clone())));
+        r.register(Arc::new(GlobTool::new(cwd)));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
         r.register(Arc::new(TaskCreateTool(store.clone())));
@@ -109,16 +135,22 @@ impl ToolRegistry {
         r
     }
 
+    /// Full registry with no persistence and default cwd (backward-compat).
+    pub fn default_registry() -> Self {
+        Self::default_registry_for(None, Arc::new(Mutex::new(None)))
+    }
+
     /// Minimal registry for sub-agents — excludes AgentTool to prevent unbounded recursion.
     pub fn minimal_registry() -> Self {
         let store = TaskStore::new();
+        let cwd: CwdRef = Arc::new(Mutex::new(None));
         let mut r = Self::new();
-        r.register(Arc::new(BashTool));
-        r.register(Arc::new(FileReadTool));
-        r.register(Arc::new(FileWriteTool));
-        r.register(Arc::new(FileEditTool));
-        r.register(Arc::new(GrepTool));
-        r.register(Arc::new(GlobTool));
+        r.register(Arc::new(BashTool::new(cwd.clone())));
+        r.register(Arc::new(FileReadTool::new(cwd.clone())));
+        r.register(Arc::new(FileWriteTool::new(cwd.clone())));
+        r.register(Arc::new(FileEditTool::new(cwd.clone())));
+        r.register(Arc::new(GrepTool::new(cwd.clone())));
+        r.register(Arc::new(GlobTool::new(cwd)));
         r.register(Arc::new(WebFetchTool));
         r.register(Arc::new(WebSearchTool));
         r.register(Arc::new(TaskCreateTool(store.clone())));

@@ -2,15 +2,19 @@ use async_trait::async_trait;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
-use super::Tool;
+use super::{resolve_path, CwdRef, Tool};
 
-pub struct FileWriteTool;
+pub struct FileWriteTool {
+    cwd: CwdRef,
+}
+
+impl FileWriteTool {
+    pub fn new(cwd: CwdRef) -> Self { Self { cwd } }
+}
 
 #[async_trait]
 impl Tool for FileWriteTool {
-    fn name(&self) -> &str {
-        "file_write"
-    }
+    fn name(&self) -> &str { "file_write" }
 
     fn description(&self) -> &str {
         "Write content to a file, creating parent directories when needed."
@@ -20,40 +24,33 @@ impl Tool for FileWriteTool {
         json!({
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The path of the file to write"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write to the file"
-                }
+                "path":    { "type": "string", "description": "The path of the file to write" },
+                "content": { "type": "string", "description": "The content to write" }
             },
             "required": ["path", "content"]
         })
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
-        let path = input["path"]
-            .as_str()
+        let raw_path = input["path"].as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required field: path"))?;
-
-        let content = input["content"]
-            .as_str()
+        let content = input["content"].as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required field: content"))?;
 
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let path = resolve_path(raw_path, &self.cwd);
+
+        if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent)
                     .await
-                    .with_context(|| format!("failed to create directories for {path}"))?;
+                    .with_context(|| format!("failed to create directories for {}", path.display()))?;
             }
         }
 
-        tokio::fs::write(path, content)
+        tokio::fs::write(&path, content)
             .await
-            .with_context(|| format!("failed to write file {path}"))?;
+            .with_context(|| format!("failed to write file {}", path.display()))?;
 
-        Ok(format!("Written {} bytes to {}", content.len(), path))
+        Ok(format!("Written {} bytes to {}", content.len(), path.display()))
     }
 }

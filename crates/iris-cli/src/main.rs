@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use iris_core::agent::Agent;
-use iris_core::config::{configure_interactive, load_config};
+use iris_core::config::{configure_interactive, load_config, user_env_path};
+use iris_core::coordinator::{Coordinator, SubTask};
+use iris_core::memory as iris_memory;
 use iris_core::context::{compress, ContextConfig};
 use iris_core::permissions::PermissionMode;
 use iris_core::reporter::Reporter;
@@ -78,6 +80,18 @@ enum Command {
     /// List all supported LLM providers and their configuration status.
     Models,
 
+    /// Run a multi-agent coordinator task (parallel sub-agents + synthesis).
+    Run {
+        /// High-level goal for the coordinator.
+        prompt: String,
+        /// Sub-task in "label:prompt" format (repeatable). If omitted, runs a single agent.
+        #[arg(short, long = "sub", value_name = "LABEL:PROMPT")]
+        subs: Vec<String>,
+        /// Override the model used for all sub-agents and synthesis.
+        #[arg(short, long)]
+        model: Option<String>,
+    },
+
     /// Start an interactive AI agent session (streaming).
     Chat {
         /// Override the model (e.g. `claude-opus-4-6-20250514`).
@@ -100,6 +114,10 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+    // Also load ~/.code-iris/.env (keys saved via `iris configure`).
+    if let Ok(env_path) = user_env_path() {
+        let _ = dotenvy::from_path(env_path);
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -119,6 +137,7 @@ async fn main() -> Result<()> {
         Command::Login => cmd_login().await?,
         Command::Logout => cmd_logout()?,
         Command::Models => cmd_models(),
+        Command::Run { prompt, subs, model } => cmd_run(prompt, subs, model).await?,
         Command::Chat { model, resume, auto, plan } => {
             cmd_chat(model, resume, auto, plan).await?
         }
@@ -186,6 +205,70 @@ fn cmd_models() {
     }
 
     println!("\nTotal: {} providers", PROVIDERS.len());
+}
+
+async fn cmd_run(
+    prompt: String,
+    subs: Vec<String>,
+    model: Option<String>,
+) -> Result<()> {
+    let mut coord = Coordinator::from_env();
+    if let Some(m) = model {
+        coord = coord.with_model(m);
+    }
+
+    if subs.is_empty() {
+        // Single-agent one-shot mode.
+        let tasks = vec![SubTask {
+            label: "main".to_string(),
+            system_prompt: String::new(),
+            prompt: prompt.clone(),
+        }];
+        eprintln!("Running single agent task…");
+        let results = coord.run(tasks).await?;
+        if let Some(r) = results.into_iter().next() {
+            println!("{}", r.response.text);
+            eprintln!("\x1b[90m[tokens in={} out={}]\x1b[0m",
+                r.response.usage.input_tokens, r.response.usage.output_tokens);
+        }
+        return Ok(());
+    }
+
+    // Multi-agent mode: parse "label:prompt" pairs.
+    let tasks: Vec<SubTask> = subs
+        .iter()
+        .map(|s| {
+            if let Some((label, sub_prompt)) = s.split_once(':') {
+                SubTask {
+                    label: label.trim().to_string(),
+                    system_prompt: String::new(),
+                    prompt: sub_prompt.trim().to_string(),
+                }
+            } else {
+                SubTask {
+                    label: s.clone(),
+                    system_prompt: String::new(),
+                    prompt: s.clone(),
+                }
+            }
+        })
+        .collect();
+
+    eprintln!("Running {} sub-agents in parallel…", tasks.len());
+
+    let synthesis_template = format!(
+        "{prompt}\n\nSub-agent results:\n\n{{results}}\n\nPlease synthesise a final answer."
+    );
+
+    let response = coord.run_with_synthesis(tasks, &synthesis_template).await?;
+
+    println!("{}", response.text);
+    eprintln!(
+        "\x1b[90m[tokens in={} out={}]\x1b[0m",
+        response.usage.input_tokens, response.usage.output_tokens
+    );
+
+    Ok(())
 }
 
 async fn cmd_chat(
@@ -312,15 +395,118 @@ fn handle_slash_command(input: &str, agent: &mut Agent) -> Option<String> {
             "Conversation cleared.".to_string()
         }
 
+        "/memory" => {
+            match iris_memory::load_notes() {
+                Ok(notes) if notes.is_empty() => "No notes saved yet. Use /memory <text> to add one.".to_string(),
+                Ok(notes) => format!("Notes:\n{notes}"),
+                Err(e) => format!("Error reading notes: {e}"),
+            }
+        }
+
+        "/commit" => {
+            match std::process::Command::new("git").args(["status", "--short"]).output() {
+                Ok(o) => {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    if s.trim().is_empty() {
+                        "Nothing to commit (working tree clean).".to_string()
+                    } else {
+                        format!("Changes:\n{s}\nUse /commit <message> to commit.")
+                    }
+                }
+                Err(e) => format!("git error: {e}"),
+            }
+        }
+
+        "/pwd" => {
+            let cwd = agent.cwd.lock().unwrap().clone();
+            match cwd {
+                Some(p) => format!("cwd: {}", p.display()),
+                None => std::env::current_dir()
+                    .map(|p| format!("cwd: {}", p.display()))
+                    .unwrap_or_else(|_| "cwd: unknown".to_string()),
+            }
+        }
+
         "/help" => "\
 Slash commands:
-  /quit, /q          Exit (session auto-saved)
-  /session           Print session ID (use with --resume to continue)
-  /messages          Show message count
-  /compact           Run context compression now
-  /clear             Clear conversation history
-  /help              Show this help"
+  /quit, /q            Exit (session auto-saved)
+  /session             Print session ID
+  /messages            Show message count
+  /compact             Run context compression now
+  /clear               Clear conversation history
+  /commit [message]    git add -A && git commit (no msg shows status)
+  /memory [note]       Save or show notes
+  /pwd                 Show current working directory
+  /cd <path>           Set working directory for tool calls
+  /worktree <branch>   Create a git worktree and cd into it
+  /help                Show this help"
             .to_string(),
+
+        other if other.starts_with("/memory ") => {
+            let note = other.trim_start_matches("/memory ").trim();
+            match iris_memory::add_note(note) {
+                Ok(()) => format!("Note saved: {note}"),
+                Err(e) => format!("Error saving note: {e}"),
+            }
+        }
+
+        other if other.starts_with("/commit ") => {
+            let msg = other.trim_start_matches("/commit ").trim();
+            let result = std::process::Command::new("git")
+                .args(["add", "-A"])
+                .output()
+                .and_then(|_| {
+                    std::process::Command::new("git")
+                        .args(["commit", "-m", msg])
+                        .output()
+                });
+            match result {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let out = if !stdout.trim().is_empty() { stdout } else { stderr };
+                    format!("git commit:\n{}", out.trim())
+                }
+                Err(e) => format!("git error: {e}"),
+            }
+        }
+
+        other if other.starts_with("/cd ") => {
+            let path_str = other.trim_start_matches("/cd ").trim();
+            let path = std::path::PathBuf::from(path_str);
+            if path.is_dir() {
+                let abs = path.canonicalize().unwrap_or(path);
+                *agent.cwd.lock().unwrap() = Some(abs.clone());
+                format!("cwd: {}", abs.display())
+            } else {
+                format!("Not a directory: {path_str}")
+            }
+        }
+
+        "/cd" => {
+            *agent.cwd.lock().unwrap() = None;
+            "Working directory reset.".to_string()
+        }
+
+        other if other.starts_with("/worktree ") => {
+            let branch = other.trim_start_matches("/worktree ").trim();
+            let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            let wt_path = home.join(".code-iris").join("worktrees").join(branch);
+            match std::process::Command::new("git")
+                .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", branch])
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    *agent.cwd.lock().unwrap() = Some(wt_path.clone());
+                    format!("Worktree created → {}", wt_path.display())
+                }
+                Ok(o) => {
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    format!("git worktree add failed: {}", e.trim())
+                }
+                Err(e) => format!("git error: {e}"),
+            }
+        }
 
         other => format!("Unknown command: {other}  (try /help)"),
     })

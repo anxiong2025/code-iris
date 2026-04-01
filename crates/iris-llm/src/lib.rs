@@ -8,6 +8,7 @@ pub mod sse;
 pub mod types;
 
 pub use anthropic::{AnthropicProvider, AuthSource};
+pub use google::GoogleProvider;
 pub use mcp::{McpClient, McpServerConfig, McpTransport};
 pub use oauth::{clear_credentials, load_credentials, login, save_credentials, OAuthTokenSet};
 pub use openai::{detect_provider, get_provider, OpenAiCompatProvider, ProviderInfo, PROVIDERS};

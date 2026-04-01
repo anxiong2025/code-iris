@@ -48,9 +48,18 @@ pub struct SubResult {
     pub response: AgentResponse,
 }
 
+/// How sub-agents obtain their LLM credentials.
+#[derive(Clone)]
+enum CoordAuth {
+    /// Explicit Anthropic API key.
+    ApiKey(String),
+    /// Auto-detect from environment (same logic as `Agent::from_env()`).
+    FromEnv,
+}
+
 /// Multi-agent coordinator.
 pub struct Coordinator {
-    api_key: String,
+    auth: CoordAuth,
     model: String,
     bus: MessageBus,
 }
@@ -58,7 +67,16 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            api_key: api_key.into(),
+            auth: CoordAuth::ApiKey(api_key.into()),
+            model: "claude-sonnet-4-6-20250514".to_string(),
+            bus: MessageBus::new(),
+        }
+    }
+
+    /// Create a coordinator that auto-detects the provider from environment variables.
+    pub fn from_env() -> Self {
+        Self {
+            auth: CoordAuth::FromEnv,
             model: "claude-sonnet-4-6-20250514".to_string(),
             bus: MessageBus::new(),
         }
@@ -69,33 +87,37 @@ impl Coordinator {
         self
     }
 
+    /// Build a fresh sub-agent for one task.
+    fn make_agent(auth: &CoordAuth, model: &str, task: &SubTask, bus: MessageBus, agent_id: String) -> Result<Agent> {
+        let mut registry = ToolRegistry::minimal_registry();
+        registry.register(Arc::new(SendMessageTool { bus, agent_id }));
+
+        let mut agent = match auth {
+            CoordAuth::ApiKey(key) => Agent::new(key)?,
+            CoordAuth::FromEnv => Agent::from_env()?,
+        };
+        agent = agent
+            .with_model(model)
+            .with_system_prompt(&task.system_prompt)
+            .with_permissions(PermissionMode::Auto)
+            .with_session(new_session());
+        agent.set_tools(registry);
+        Ok(agent)
+    }
+
     /// Run all sub-tasks concurrently and return their results in order.
     pub async fn run(&self, tasks: Vec<SubTask>) -> Result<Vec<SubResult>> {
         let handles: Vec<JoinHandle<Result<SubResult>>> = tasks
             .into_iter()
             .enumerate()
             .map(|(i, task)| {
-                let api_key = self.api_key.clone();
+                let auth = self.auth.clone();
                 let model = self.model.clone();
                 let bus = self.bus.clone();
                 let agent_id = format!("sub-{i}");
 
                 tokio::spawn(async move {
-                    let mut registry = ToolRegistry::minimal_registry();
-                    registry.register(Arc::new(SendMessageTool {
-                        bus,
-                        agent_id: agent_id.clone(),
-                    }));
-
-                    let mut agent = Agent::new(&api_key)?
-                        .with_model(model)
-                        .with_system_prompt(&task.system_prompt)
-                        .with_permissions(PermissionMode::Auto)
-                        .with_session(new_session());
-
-                    // Override the tool registry so it includes SendMessageTool.
-                    agent.set_tools(registry);
-
+                    let mut agent = Self::make_agent(&auth, &model, &task, bus, agent_id)?;
                     let response = agent.chat(&task.prompt).await?;
                     Ok(SubResult { label: task.label, response })
                 })
@@ -126,7 +148,11 @@ impl Coordinator {
 
         let synthesis_prompt = synthesis_prompt_template.replace("{results}", &combined);
 
-        let mut synth_agent = Agent::new(&self.api_key)?
+        let mut synth_agent = match &self.auth {
+            CoordAuth::ApiKey(key) => Agent::new(key)?,
+            CoordAuth::FromEnv => Agent::from_env()?,
+        };
+        synth_agent = synth_agent
             .with_model(&self.model)
             .with_permissions(PermissionMode::Auto);
 

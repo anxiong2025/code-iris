@@ -267,3 +267,120 @@ pub async fn autocompact(
     );
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iris_llm::{ContentBlock, Message, Role};
+
+    fn user_msg(text: &str) -> Message {
+        Message { role: Role::User, content: vec![ContentBlock::Text { text: text.to_string() }] }
+    }
+    fn asst_msg(text: &str) -> Message {
+        Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: text.to_string() }] }
+    }
+    fn tool_result_msg(content: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id1".to_string(),
+                content: content.to_string(),
+                is_error: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn count_tokens_empty() {
+        assert_eq!(count_tokens(&[]), 0);
+    }
+
+    #[test]
+    fn count_tokens_single_message() {
+        let msgs = vec![user_msg("hello")]; // 5 bytes → 1 token + 4 overhead = 5
+        assert!(count_tokens(&msgs) >= 1);
+    }
+
+    #[test]
+    fn truncate_tool_result_oversized() {
+        let big = "x".repeat(400); // 400 bytes → 100 tokens, max is 10
+        let mut msgs = vec![tool_result_msg(&big)];
+        truncate_tool_results(&mut msgs, 10);
+        if let ContentBlock::ToolResult { content, .. } = &msgs[0].content[0] {
+            assert!(content.contains("truncated"));
+            assert!(content.len() < big.len());
+        } else {
+            panic!("expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn truncate_tool_result_small_unchanged() {
+        let small = "abc";
+        let mut msgs = vec![tool_result_msg(small)];
+        truncate_tool_results(&mut msgs, 10_000);
+        if let ContentBlock::ToolResult { content, .. } = &msgs[0].content[0] {
+            assert_eq!(content, small);
+        }
+    }
+
+    #[test]
+    fn snip_oldest_removes_middle_turns() {
+        // Build 6 user+asst pairs — very small token budget forces snipping.
+        let mut msgs: Vec<Message> = (0..6)
+            .flat_map(|i| [user_msg(&format!("u{i}")), asst_msg(&format!("a{i}"))])
+            .collect();
+        let before = msgs.len();
+        snip_oldest(&mut msgs, 5, 2); // tiny budget → should remove some turns
+        assert!(msgs.len() < before, "expected some messages to be removed");
+    }
+
+    #[test]
+    fn snip_oldest_preserves_first_and_last_turns() {
+        let mut msgs: Vec<Message> = (0..6)
+            .flat_map(|i| [user_msg(&format!("u{i}")), asst_msg(&format!("a{i}"))])
+            .collect();
+        snip_oldest(&mut msgs, 1, 2);
+        // First user message must still be there.
+        assert!(msgs.iter().any(|m| m.role == Role::User));
+    }
+
+    #[test]
+    fn microcompact_collapses_old_assistant_turns() {
+        let long_text = "word ".repeat(50); // >120 chars
+        let mut msgs = vec![
+            asst_msg(&long_text),
+            asst_msg(&long_text),
+            asst_msg("recent short"),
+        ];
+        microcompact(&mut msgs, 1); // keep only last 1 assistant turn intact
+        if let ContentBlock::Text { text } = &msgs[0].content[0] {
+            assert!(text.contains("[collapsed]"), "old turn should be collapsed");
+        }
+        if let ContentBlock::Text { text } = &msgs[2].content[0] {
+            assert_eq!(text, "recent short", "recent turn must be unchanged");
+        }
+    }
+
+    #[test]
+    fn compress_noop_when_under_budget() {
+        let cfg = ContextConfig { max_tokens: 100_000, ..Default::default() };
+        let mut msgs = vec![user_msg("hi"), asst_msg("hello")];
+        let changed = compress(&mut msgs, &cfg);
+        assert!(!changed);
+    }
+
+    #[test]
+    fn compress_triggers_when_over_budget() {
+        // One huge tool result will trigger level 1.
+        let big = "x".repeat(100_000);
+        let cfg = ContextConfig {
+            max_tokens: 100,
+            max_tool_result_tokens: 10,
+            keep_recent_turns: 1,
+        };
+        let mut msgs = vec![tool_result_msg(&big)];
+        let changed = compress(&mut msgs, &cfg);
+        assert!(changed);
+    }
+}

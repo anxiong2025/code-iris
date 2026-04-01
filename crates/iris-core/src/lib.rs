@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod memory;
 pub mod context;
 pub mod coordinator;
 pub mod models;

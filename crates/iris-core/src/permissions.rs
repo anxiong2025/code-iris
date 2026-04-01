@@ -116,3 +116,70 @@ pub fn format_preview(tool_name: &str, input: &serde_json::Value) -> String {
         _ => String::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_allows_all_tools() {
+        let mode = PermissionMode::Auto;
+        assert!(mode.is_allowed("bash"));
+        assert!(mode.is_allowed("file_write"));
+        assert!(mode.is_allowed("file_edit"));
+        assert!(mode.is_allowed("grep"));
+    }
+
+    #[test]
+    fn plan_blocks_dangerous_tools() {
+        let mode = PermissionMode::Plan;
+        assert!(!mode.is_allowed("bash"));
+        assert!(!mode.is_allowed("file_write"));
+        assert!(!mode.is_allowed("file_edit"));
+    }
+
+    #[test]
+    fn plan_allows_read_tools() {
+        let mode = PermissionMode::Plan;
+        assert!(mode.is_allowed("grep"));
+        assert!(mode.is_allowed("file_read"));
+        assert!(mode.is_allowed("glob"));
+    }
+
+    #[test]
+    fn default_blocks_dangerous_tools() {
+        let mode = PermissionMode::Default;
+        assert!(!mode.is_allowed("bash"));
+        assert!(!mode.is_allowed("file_write"));
+    }
+
+    #[test]
+    fn default_allows_read_tools() {
+        let mode = PermissionMode::Default;
+        assert!(mode.is_allowed("grep"));
+        assert!(mode.is_allowed("file_read"));
+    }
+
+    #[test]
+    fn custom_allows_only_listed() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("bash".to_string());
+        let mode = PermissionMode::Custom { allowed };
+        assert!(mode.is_allowed("bash"));
+        assert!(!mode.is_allowed("file_write"));
+        assert!(!mode.is_allowed("grep"));
+    }
+
+    #[test]
+    fn format_preview_bash() {
+        let input = serde_json::json!({ "command": "ls -la" });
+        let preview = format_preview("bash", &input);
+        assert_eq!(preview, "ls -la");
+    }
+
+    #[test]
+    fn format_preview_unknown_tool() {
+        let preview = format_preview("some_tool", &serde_json::json!({}));
+        assert!(preview.is_empty());
+    }
+}

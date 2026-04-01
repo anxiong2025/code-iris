@@ -24,13 +24,17 @@ use tokio::sync::mpsc;
 
 mod app;
 mod input;
+mod markdown;
 mod statusbar;
 mod welcome;
 
 use app::{AgentEvent, AgentState, App, AppMode, ChatRole};
 use iris_core::agent::Agent;
+use iris_core::config::user_env_path;
 use iris_core::context::compress;
+use iris_core::memory as iris_memory;
 use iris_core::permissions::PermissionMode;
+use iris_core::storage::Storage;
 
 /// Commands sent from the TUI event loop to the agent worker.
 enum WorkerCmd {
@@ -40,6 +44,12 @@ enum WorkerCmd {
     SetModel(String),
     /// /compact — manually trigger context compression.
     Compact,
+    /// /resume <id> — replace current session with a saved one.
+    LoadSession(String),
+    /// /cd <path> — change working directory for all tool calls.
+    SetCwd(std::path::PathBuf),
+    /// /cd — reset to process cwd.
+    ResetCwd,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -47,6 +57,9 @@ enum WorkerCmd {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    if let Ok(env_path) = user_env_path() {
+        let _ = dotenvy::from_path(env_path);
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -103,6 +116,32 @@ async fn agent_worker(
             WorkerCmd::SetModel(model) => {
                 agent = agent.with_model(&model);
                 let _ = tx_events.send(AgentEvent::System(format!("Model switched to: {model}")));
+            }
+            WorkerCmd::SetCwd(path) => {
+                *agent.cwd.lock().unwrap() = Some(path.clone());
+                let _ = tx_events.send(AgentEvent::System(
+                    format!("Working directory: {}", path.display())
+                ));
+            }
+            WorkerCmd::ResetCwd => {
+                *agent.cwd.lock().unwrap() = None;
+                let _ = tx_events.send(AgentEvent::System("Working directory reset.".to_string()));
+            }
+            WorkerCmd::LoadSession(id) => {
+                match iris_core::storage::Storage::new().and_then(|s| s.load(&id)) {
+                    Ok(session) => {
+                        let msg_count = session.messages.len();
+                        agent.session = session;
+                        let _ = tx_events.send(AgentEvent::System(format!(
+                            "Resumed session {id} — {msg_count} messages loaded."
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx_events.send(AgentEvent::Error(format!(
+                            "Failed to load session '{id}': {e}"
+                        )));
+                    }
+                }
             }
             WorkerCmd::Compact => {
                 let cfg = iris_core::context::ContextConfig::default();
@@ -206,7 +245,11 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
         let cmd = input.trim();
         match cmd {
             "/help" => {
-                app.push_system("/help  /clear  /session  /model [name]  /compact  exit|quit");
+                app.push_system(
+                    "/help  /clear  /session  /sessions  /resume <id>\n  \
+                     /model [name]  /compact  /commit [msg]  /memory [note]\n  \
+                     /cd <path>  /pwd  /worktree <branch>  exit|quit"
+                );
             }
             "/clear" => {
                 app.chat_history.clear();
@@ -223,9 +266,125 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
             "/model" => {
                 app.push_system(format!("Current model: {}", app.model_name));
             }
+            "/sessions" => {
+                match Storage::new().and_then(|s| s.list()) {
+                    Ok(ids) if ids.is_empty() => app.push_system("No saved sessions."),
+                    Ok(ids) => {
+                        let list = ids.join("\n  ");
+                        app.push_system(format!("Saved sessions:\n  {list}"));
+                    }
+                    Err(e) => app.push_system(format!("Error listing sessions: {e}")),
+                }
+            }
             "/compact" => {
                 // Send to worker — it will compress and reply via AgentEvent::System
                 if tx_input.send(WorkerCmd::Compact).await.is_err() {
+                    app.push_system("Agent worker stopped unexpectedly.");
+                }
+            }
+            "/memory" => {
+                match iris_memory::load_notes() {
+                    Ok(notes) if notes.is_empty() => app.push_system("No notes saved yet. Use /memory <text> to add one."),
+                    Ok(notes) => app.push_system(format!("Notes:\n{notes}")),
+                    Err(e) => app.push_system(format!("Error reading notes: {e}")),
+                }
+            }
+            "/pwd" => {
+                // Ask the worker for current cwd.
+                if tx_input.send(WorkerCmd::ResetCwd).await.is_err() {
+                    // If it fails, just show process cwd.
+                }
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                app.push_system(format!("Process cwd: {cwd}"));
+            }
+            "/commit" => {
+                // git commit with no message — show status
+                let output = std::process::Command::new("git")
+                    .args(["status", "--short"])
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let s = String::from_utf8_lossy(&o.stdout);
+                        if s.trim().is_empty() {
+                            app.push_system("Nothing to commit (working tree clean).");
+                        } else {
+                            app.push_system(format!("Staged/unstaged changes:\n{s}\nUse /commit <message> to commit."));
+                        }
+                    }
+                    Err(e) => app.push_system(format!("git error: {e}")),
+                }
+            }
+            _ if cmd.starts_with("/memory ") => {
+                let note = cmd.trim_start_matches("/memory ").trim();
+                match iris_memory::add_note(note) {
+                    Ok(()) => app.push_system(format!("Note saved: {note}")),
+                    Err(e) => app.push_system(format!("Error saving note: {e}")),
+                }
+            }
+            _ if cmd.starts_with("/commit ") => {
+                let msg = cmd.trim_start_matches("/commit ").trim().to_string();
+                let output = std::process::Command::new("git")
+                    .args(["add", "-A"])
+                    .output()
+                    .and_then(|_| {
+                        std::process::Command::new("git")
+                            .args(["commit", "-m", &msg])
+                            .output()
+                    });
+                match output {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        let out = if !stdout.trim().is_empty() { stdout.as_ref() } else { stderr.as_ref() };
+                        app.push_system(format!("git commit:\n{}", out.trim()));
+                    }
+                    Err(e) => app.push_system(format!("git error: {e}")),
+                }
+            }
+            _ if cmd.starts_with("/cd ") => {
+                let path_str = cmd.trim_start_matches("/cd ").trim();
+                let path = std::path::PathBuf::from(path_str);
+                if path.is_dir() {
+                    let abs = path.canonicalize().unwrap_or(path);
+                    if tx_input.send(WorkerCmd::SetCwd(abs)).await.is_err() {
+                        app.push_system("Agent worker stopped unexpectedly.");
+                    }
+                } else {
+                    app.push_system(format!("Not a directory: {path_str}"));
+                }
+            }
+            "/cd" => {
+                if tx_input.send(WorkerCmd::ResetCwd).await.is_err() {
+                    app.push_system("Agent worker stopped unexpectedly.");
+                }
+            }
+            _ if cmd.starts_with("/worktree ") => {
+                let branch = cmd.trim_start_matches("/worktree ").trim().to_string();
+                let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+                let wt_path = home.join(".code-iris").join("worktrees").join(&branch);
+                let create = std::process::Command::new("git")
+                    .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", &branch])
+                    .output();
+                match create {
+                    Ok(o) if o.status.success() => {
+                        if tx_input.send(WorkerCmd::SetCwd(wt_path.clone())).await.is_err() {
+                            app.push_system("Agent worker stopped unexpectedly.");
+                        } else {
+                            app.push_system(format!("Worktree created and cwd set to {}", wt_path.display()));
+                        }
+                    }
+                    Ok(o) => {
+                        let e = String::from_utf8_lossy(&o.stderr);
+                        app.push_system(format!("git worktree add failed: {}", e.trim()));
+                    }
+                    Err(e) => app.push_system(format!("git error: {e}")),
+                }
+            }
+            _ if cmd.starts_with("/resume ") => {
+                let id = cmd.trim_start_matches("/resume ").trim().to_string();
+                if tx_input.send(WorkerCmd::LoadSession(id)).await.is_err() {
                     app.push_system("Agent worker stopped unexpectedly.");
                 }
             }
@@ -290,11 +449,11 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
                     "iris",
                     Style::default().fg(Color::Rgb(255, 140, 60)).bold(),
                 )));
-                for line in entry.content.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {line}"),
-                        Style::default().fg(Color::Rgb(220, 220, 220)),
-                    )));
+                for md_line in markdown::render_markdown(&entry.content) {
+                    // indent by 2 spaces
+                    let mut indented = vec![Span::raw("  ")];
+                    indented.extend(md_line.spans);
+                    lines.push(Line::from(indented));
                 }
             }
             ChatRole::Tool => {

@@ -80,3 +80,69 @@ impl Session {
 pub fn new_session() -> Session {
     Session::new()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_storage() -> (Storage, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("iris_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Storage { dir: dir.clone() }, dir)
+    }
+
+    #[test]
+    fn session_new_has_unique_ids() {
+        let s1 = Session::new();
+        let s2 = Session::new();
+        assert_ne!(s1.id, s2.id);
+        assert!(s1.messages.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let (storage, dir) = temp_storage();
+        let mut session = Session::new();
+        session.messages.push(iris_llm::Message::user("hello"));
+
+        storage.save(&session).unwrap();
+        let loaded = storage.load(&session.id).unwrap();
+
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.messages.len(), 1);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn load_nonexistent_returns_error() {
+        let (storage, dir) = temp_storage();
+        let result = storage.load("no_such_id");
+        assert!(result.is_err());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn list_returns_saved_ids() {
+        let (storage, dir) = temp_storage();
+        let s1 = Session::new();
+        let s2 = Session::new();
+        storage.save(&s1).unwrap();
+        storage.save(&s2).unwrap();
+
+        let ids = storage.list().unwrap();
+        assert!(ids.contains(&s1.id));
+        assert!(ids.contains(&s2.id));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn list_empty_directory() {
+        let (storage, dir) = temp_storage();
+        let ids = storage.list().unwrap();
+        assert!(ids.is_empty());
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

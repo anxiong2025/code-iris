@@ -18,15 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iris_llm::{
-    AnthropicProvider, ContentBlock, Message, ModelConfig, OpenAiCompatProvider, Role,
-    StreamEvent, TokenUsage,
+    AnthropicProvider, ContentBlock, GoogleProvider, Message, ModelConfig, OpenAiCompatProvider,
+    Role, StreamEvent, TokenUsage,
 };
 use tokio::task::JoinSet;
 
-use crate::context::{autocompact, compress, ContextConfig};
+use crate::context::{compress, ContextConfig};
 use crate::permissions::{format_preview, PermissionMode};
 use crate::storage::{new_session, Session, Storage};
-use crate::tools::ToolRegistry;
+use crate::tools::{CwdRef, ToolRegistry};
 
 /// Maximum tool-call rounds per user turn (prevents infinite loops).
 const MAX_TURNS: usize = 20;
@@ -42,10 +42,11 @@ pub struct AgentResponse {
     pub usage: TokenUsage,
 }
 
-/// Unified LLM backend — either Anthropic native or OpenAI-compatible.
+/// Unified LLM backend — Anthropic native, OpenAI-compatible, or Google Gemini.
 pub enum LlmProvider {
     Anthropic(AnthropicProvider),
     OpenAiCompat(OpenAiCompatProvider),
+    Google(GoogleProvider),
 }
 
 
@@ -58,33 +59,41 @@ pub struct Agent {
     pub permissions: PermissionMode,
     pub session: Session,
     storage: Storage,
+    /// Shared working-directory reference — injected into all I/O tools.
+    pub cwd: CwdRef,
 }
 
 impl Agent {
     /// Create an agent using the Anthropic provider with sensible defaults.
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
+        let session = new_session();
+        let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
         Ok(Self {
             provider: LlmProvider::Anthropic(AnthropicProvider::new(api_key)),
             config: ModelConfig::new("claude-sonnet-4-6-20250514"),
-            tools: ToolRegistry::default_registry(),
+            tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
             context_cfg: ContextConfig::default(),
             permissions: PermissionMode::Default,
-            session: new_session(),
+            session,
             storage: Storage::new()?,
+            cwd,
         })
     }
 
     /// Create an agent using an OpenAI-compatible provider (Qwen, DeepSeek, etc.).
     pub fn new_openai_compat(provider: OpenAiCompatProvider) -> Result<Self> {
         let default_model = provider.default_model.clone();
+        let session = new_session();
+        let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
         Ok(Self {
             provider: LlmProvider::OpenAiCompat(provider),
             config: ModelConfig::new(default_model),
-            tools: ToolRegistry::default_registry(),
+            tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
             context_cfg: ContextConfig::default(),
             permissions: PermissionMode::Default,
-            session: new_session(),
+            session,
             storage: Storage::new()?,
+            cwd,
         })
     }
 
@@ -97,19 +106,36 @@ impl Agent {
 
         // 1. OAuth / Anthropic API key
         let mut agent = if let Some(auth) = AuthSource::from_env() {
+            let session = new_session();
+            let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
             Self {
                 provider: LlmProvider::Anthropic(AnthropicProvider::with_auth_pub(auth)),
                 config: ModelConfig::new("claude-sonnet-4-6-20250514"),
-                tools: ToolRegistry::default_registry(),
+                tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
                 context_cfg: ContextConfig::default(),
                 permissions: PermissionMode::Default,
-                session: new_session(),
+                session,
                 storage: Storage::new()?,
+                cwd,
             }
         } else if let Some(info) = detect_provider() {
-            // 2. Any other configured provider
+            // 2. Google Gemini
             let key = std::env::var(info.env_key).unwrap_or_default();
-            if info.name != "anthropic" && !key.is_empty() {
+            if info.name == "google" && !key.is_empty() {
+                let session = new_session();
+                let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
+                Self {
+                    provider: LlmProvider::Google(GoogleProvider::new(key)),
+                    config: ModelConfig::new(info.default_model),
+                    tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
+                    context_cfg: ContextConfig::default(),
+                    permissions: PermissionMode::Default,
+                    session,
+                    storage: Storage::new()?,
+                    cwd,
+                }
+            // 3. Any other OpenAI-compat provider
+            } else if info.name != "anthropic" && !key.is_empty() {
                 let compat = OpenAiCompatProvider::new(
                     info.name, key, info.base_url, info.default_model,
                 );
@@ -139,7 +165,7 @@ impl Agent {
     fn load_mcp_tools(&mut self) {
         use crate::config::load_config;
         use crate::tools::mcp_tool::McpToolWrapper;
-        use iris_llm::{McpClient, McpServerConfig};
+        use iris_llm::McpClient;
         use std::sync::Arc;
 
         let config = match load_config() {
@@ -228,12 +254,10 @@ impl Agent {
             }
             // Level 4: autocompact via LLM when levels 1–3 are still over budget.
             if crate::context::count_tokens(&self.session.messages) > self.context_cfg.max_tokens {
-                if let LlmProvider::Anthropic(ref mut p) = self.provider {
-                    match autocompact(&mut self.session.messages, p, &self.context_cfg).await {
-                        Ok(true) => tracing::info!(turn, "autocompact: conversation summarised"),
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!(turn, "autocompact failed: {e}"),
-                    }
+                match self.autocompact_with_provider().await {
+                    Ok(true) => tracing::info!(turn, "autocompact: conversation summarised"),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(turn, "autocompact failed: {e}"),
                 }
             }
 
@@ -255,6 +279,11 @@ impl Agent {
                                 .context("LLM stream failed")?,
                         ),
                         LlmProvider::OpenAiCompat(p) => Box::pin(
+                            p.chat_stream(&messages, &defs, &config)
+                                .await
+                                .context("LLM stream failed")?,
+                        ),
+                        LlmProvider::Google(p) => Box::pin(
                             p.chat_stream(&messages, &defs, &config)
                                 .await
                                 .context("LLM stream failed")?,
@@ -391,6 +420,95 @@ impl Agent {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Level-4 autocompact using whichever provider is active.
+    ///
+    /// Uses the cheapest/fastest available model per provider.
+    async fn autocompact_with_provider(&mut self) -> Result<bool> {
+        use crate::context::count_tokens;
+        use futures::StreamExt;
+        use iris_llm::{ModelConfig, StreamEvent};
+
+        if count_tokens(&self.session.messages) <= self.context_cfg.max_tokens {
+            return Ok(false);
+        }
+
+        let mut transcript = String::new();
+        for msg in &self.session.messages {
+            let role = match msg.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+                Role::Tool => "Tool",
+            };
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        transcript.push_str(&format!("{role}: {text}\n\n"));
+                    }
+                    ContentBlock::ToolUse { name, .. } => {
+                        transcript.push_str(&format!("{role}: [called tool: {name}]\n\n"));
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        let preview: String = content.chars().take(200).collect();
+                        transcript.push_str(&format!("Tool result: {preview}…\n\n"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let prompt = format!(
+            "Summarise this conversation concisely, preserving all important context, \
+             decisions, file paths, code changes, and open questions.\n\n{transcript}"
+        );
+        let summary_messages = vec![Message::user(&prompt)];
+
+        // Pick a fast/cheap model per provider.
+        let compact_model = match &self.provider {
+            LlmProvider::Anthropic(_) => "claude-haiku-4-5-20251001",
+            LlmProvider::OpenAiCompat(p) => p.default_model.as_str(),
+            LlmProvider::Google(_) => "gemini-2.0-flash",
+        };
+        let summary_config = ModelConfig::new(compact_model).with_max_tokens(2048);
+
+        let mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>> =
+            match &mut self.provider {
+                LlmProvider::Anthropic(p) => Box::pin(
+                    p.chat_stream(&summary_messages, &[], &summary_config).await?,
+                ),
+                LlmProvider::OpenAiCompat(p) => Box::pin(
+                    p.chat_stream(&summary_messages, &[], &summary_config).await?,
+                ),
+                LlmProvider::Google(p) => Box::pin(
+                    p.chat_stream(&summary_messages, &[], &summary_config).await?,
+                ),
+            };
+
+        let mut summary = String::new();
+        while let Some(event) = stream.next().await {
+            if let Ok(StreamEvent::TextDelta { text }) = event {
+                summary.push_str(&text);
+            }
+        }
+
+        if summary.trim().is_empty() {
+            return Ok(false);
+        }
+
+        let keep_n = self.context_cfg.keep_recent_turns * 2;
+        let recent: Vec<Message> = self.session.messages
+            .iter().rev().take(keep_n).cloned()
+            .collect::<Vec<_>>().into_iter().rev().collect();
+
+        self.session.messages.clear();
+        self.session.messages.push(Message::assistant(format!(
+            "[Conversation summary]\n\n{summary}"
+        )));
+        self.session.messages.extend(recent);
+
+        tracing::info!("autocompact: compressed to {} messages", self.session.messages.len());
+        Ok(true)
+    }
 
     fn touch_and_save(&mut self) -> Result<()> {
         self.session.updated_at = SystemTime::now()

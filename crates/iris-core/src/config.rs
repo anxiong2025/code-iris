@@ -55,38 +55,82 @@ pub fn load_config() -> Result<IrisConfig> {
     Ok(config)
 }
 
-pub fn configure_interactive() -> Result<()> {
-    println!("Code Iris Configuration");
-    println!();
-    println!("API keys are read from environment variables or a local .env file.");
-    println!("Current status:");
+/// Path to the per-user `.env` file managed by `iris configure`.
+pub fn user_env_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join(".env"))
+}
 
-    for (label, env_key) in [
-        ("Anthropic", "ANTHROPIC_API_KEY"),
-        ("OpenAI", "OPENAI_API_KEY"),
-        ("Google", "GOOGLE_API_KEY"),
-        ("DeepSeek", "DEEPSEEK_API_KEY"),
-        ("Groq", "GROQ_API_KEY"),
-        ("OpenRouter", "OPENROUTER_API_KEY"),
-    ] {
-        let status = match std::env::var(env_key) {
-            Ok(value) if !value.trim().is_empty() => "set",
-            _ => "not set",
+pub fn configure_interactive() -> Result<()> {
+    use iris_llm::PROVIDERS;
+
+    let dir = config_dir()?;
+    let env_path = dir.join(".env");
+
+    println!("iris configure\n");
+
+    // ── Show provider status ──────────────────────────────────────────────────
+    println!("{:<4} {:<20} {:<32} Status", "#", "Provider", "Env var");
+    println!("{}", "-".repeat(70));
+    for (i, p) in PROVIDERS.iter().enumerate() {
+        let status = if std::env::var(p.env_key).map(|v| !v.trim().is_empty()).unwrap_or(false) {
+            "\x1b[32m✓ set\x1b[0m"
+        } else {
+            "\x1b[90m✗ not set\x1b[0m"
         };
-        println!("  {label:<12} {status} ({env_key})");
+        println!("{:<4} {:<20} {:<32} {}", i + 1, p.name, p.env_key, status);
     }
 
+    println!();
+    if env_path.exists() {
+        println!("Existing keys file: {}", env_path.display());
+    }
+    println!("Keys can also be set as environment variables or in a shell .env file.");
+    println!();
+
+    // ── Optionally save an API key ────────────────────────────────────────────
+    print!("Save an API key to {} ? [y/N]: ", env_path.display());
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim().to_lowercase() == "y" {
+        print!("Provider number (1-{}): ", PROVIDERS.len());
+        io::stdout().flush()?;
+        let mut num_str = String::new();
+        io::stdin().read_line(&mut num_str)?;
+        if let Ok(n) = num_str.trim().parse::<usize>() {
+            if n >= 1 && n <= PROVIDERS.len() {
+                let p = &PROVIDERS[n - 1];
+                print!("{} (will be saved to file, not echoed): ", p.env_key);
+                io::stdout().flush()?;
+                let mut key = String::new();
+                io::stdin().read_line(&mut key)?;
+                let key = key.trim();
+                if !key.is_empty() {
+                    append_env_file(&env_path, p.env_key, key)?;
+                    // Apply immediately for the rest of this configure run.
+                    // SAFETY: configure_interactive is single-threaded by design.
+                    unsafe { std::env::set_var(p.env_key, key); }
+                    println!("Saved to {}", env_path.display());
+                } else {
+                    println!("Empty — skipped.");
+                }
+            } else {
+                println!("Invalid number — skipped.");
+            }
+        }
+        println!();
+    }
+
+    // ── Default provider / model ──────────────────────────────────────────────
     let mut config = load_config().unwrap_or_default();
 
     print!(
         "Default provider [{}]: ",
         config.default_provider.as_deref().unwrap_or("anthropic")
     );
-    io::stdout().flush().context("failed to flush stdout")?;
+    io::stdout().flush()?;
     let mut provider = String::new();
-    io::stdin()
-        .read_line(&mut provider)
-        .context("failed to read provider")?;
+    io::stdin().read_line(&mut provider)?;
     let provider = provider.trim();
     if !provider.is_empty() {
         config.default_provider = Some(provider.to_string());
@@ -98,11 +142,9 @@ pub fn configure_interactive() -> Result<()> {
         "Default model [{}]: ",
         config.default_model.as_deref().unwrap_or("provider default")
     );
-    io::stdout().flush().context("failed to flush stdout")?;
+    io::stdout().flush()?;
     let mut model = String::new();
-    io::stdin()
-        .read_line(&mut model)
-        .context("failed to read model")?;
+    io::stdin().read_line(&mut model)?;
     let model = model.trim();
     if !model.is_empty() {
         config.default_model = Some(model.to_string());
@@ -111,10 +153,34 @@ pub fn configure_interactive() -> Result<()> {
     config.save()?;
 
     println!();
+    println!("Configuration saved to {}",  dir.join("config.toml").display());
     println!(
-        "Saved configuration to {}",
-        config_dir()?.join("config.toml").display()
+        "Run `iris chat` to start a session.\n\
+         Tip: add `source {}` to your shell profile to auto-load keys.",
+        env_path.display()
     );
-    println!("Set API keys with environment variables such as `ANTHROPIC_API_KEY=...`.");
+    Ok(())
+}
+
+/// Append or overwrite a single `KEY=value` line in the .env file.
+fn append_env_file(path: &std::path::Path, key: &str, value: &str) -> Result<()> {
+    // Read existing lines, replace if key already present.
+    let existing = if path.exists() {
+        std::fs::read_to_string(path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let prefix = format!("{key}=");
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.starts_with(&prefix))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("{key}={value}"));
+
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+    std::fs::write(path, lines.join("\n") + "\n")
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }

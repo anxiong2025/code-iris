@@ -3,17 +3,21 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-use super::Tool;
+use super::{resolve_path, CwdRef, Tool};
 
-pub struct GrepTool;
+pub struct GrepTool {
+    cwd: CwdRef,
+}
+
+impl GrepTool {
+    pub fn new(cwd: CwdRef) -> Self { Self { cwd } }
+}
 
 const MAX_RESULTS: usize = 100;
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &str {
-        "grep"
-    }
+    fn name(&self) -> &str { "grep" }
 
     fn description(&self) -> &str {
         "Search for a pattern using grep -rn and return matching lines."
@@ -23,41 +27,28 @@ impl Tool for GrepTool {
         json!({
             "type": "object",
             "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The regex pattern to search for"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "The directory or file to search in (default: current directory)"
-                },
-                "file_glob": {
-                    "type": "string",
-                    "description": "Optional glob pattern to filter which files to search (e.g. '*.rs')"
-                }
+                "pattern":   { "type": "string", "description": "The regex pattern to search for" },
+                "path":      { "type": "string", "description": "Directory or file to search (default: .)" },
+                "file_glob": { "type": "string", "description": "Glob filter e.g. '*.rs'" }
             },
             "required": ["pattern"]
         })
     }
 
     async fn execute(&self, input: Value) -> Result<String> {
-        let pattern = input["pattern"]
-            .as_str()
+        let pattern = input["pattern"].as_str()
             .ok_or_else(|| anyhow::anyhow!("missing required field: pattern"))?;
 
-        let search_path = input["path"].as_str().unwrap_or(".");
+        let raw_path = input["path"].as_str().unwrap_or(".");
+        let search_path = resolve_path(raw_path, &self.cwd);
         let file_glob = input["file_glob"].as_str();
 
         let mut cmd = Command::new("grep");
-        cmd.arg("-rn");
-        cmd.arg("--color=never");
-
+        cmd.arg("-rn").arg("--color=never");
         if let Some(glob) = file_glob {
-            cmd.arg(format!("--include={}", glob));
+            cmd.arg(format!("--include={glob}"));
         }
-
-        cmd.arg(pattern);
-        cmd.arg(search_path);
+        cmd.arg(pattern).arg(&search_path);
 
         let output = cmd.output().await.context("failed to run grep")?;
 
@@ -82,12 +73,9 @@ impl Tool for GrepTool {
         let mut result = to_show.join("\n");
         if truncated {
             result.push_str(&format!(
-                "\n[truncated, showing {} of {} matches]",
-                MAX_RESULTS,
-                lines.len()
+                "\n[truncated, showing {MAX_RESULTS} of {} matches]", lines.len()
             ));
         }
-
         Ok(result)
     }
 }

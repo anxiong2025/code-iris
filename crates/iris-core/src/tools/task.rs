@@ -1,12 +1,14 @@
-//! Task management tools — create, update, list, and inspect in-session tasks.
+//! Task management tools — create, update, list, and inspect tasks.
 //!
 //! These tools mirror Claude Code's `TaskCreate / TaskUpdate / TaskList / TaskGet`
 //! and give the agent a way to plan and track multi-step work within a single session.
 //!
-//! Tasks are stored in a thread-local `TaskStore` so they are lightweight and
-//! require no additional I/O. They are NOT persisted across sessions.
+//! Tasks are persisted to `~/.code-iris/tasks/<session_id>.json` when a session
+//! ID is supplied at construction time. Without a session ID they fall back to
+//! in-memory only (useful for ephemeral sub-agents).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -47,35 +49,87 @@ pub struct Task {
     pub output: Option<String>,
 }
 
-/// Shared in-memory task store, injected into each task tool.
-#[derive(Debug, Default, Clone)]
-pub struct TaskStore(Arc<Mutex<HashMap<String, Task>>>);
+// ── TaskStore internals ──────────────────────────────────────────────────────
+
+struct Inner {
+    tasks: HashMap<String, Task>,
+    /// When set, every mutation is persisted here.
+    path: Option<PathBuf>,
+}
+
+impl Inner {
+    fn save(&self) {
+        if let Some(ref path) = self.path {
+            if let Ok(json) = serde_json::to_string_pretty(&self.tasks) {
+                // Best-effort — ignore I/O errors (don't break the agent turn).
+                let _ = std::fs::write(path, json);
+            }
+        }
+    }
+}
+
+/// Shared task store, injected into each task tool.
+///
+/// Cheap to clone — backed by `Arc<Mutex<Inner>>`.
+#[derive(Clone, Default)]
+pub struct TaskStore(Arc<Mutex<Inner>>);
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self { tasks: HashMap::new(), path: None }
+    }
+}
 
 impl TaskStore {
+    /// In-memory only (no persistence).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Persistent store tied to a session.
+    ///
+    /// Existing tasks are loaded from disk if the file exists.
+    /// All future mutations are auto-saved to the same file.
+    pub fn for_session(session_id: &str) -> Result<Self> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        let dir = home.join(".code-iris").join("tasks");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{session_id}.json"));
+
+        let tasks: HashMap<String, Task> = if path.exists() {
+            let raw = std::fs::read_to_string(&path)?;
+            serde_json::from_str(&raw).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        Ok(Self(Arc::new(Mutex::new(Inner { tasks, path: Some(path) }))))
+    }
+
     fn next_id(&self) -> String {
         let guard = self.0.lock().unwrap();
-        format!("task_{}", guard.len() + 1)
+        format!("task_{}", guard.tasks.len() + 1)
     }
 
     fn insert(&self, task: Task) {
-        self.0.lock().unwrap().insert(task.id.clone(), task);
+        let mut guard = self.0.lock().unwrap();
+        guard.tasks.insert(task.id.clone(), task);
+        guard.save();
     }
 
     fn get(&self, id: &str) -> Option<Task> {
-        self.0.lock().unwrap().get(id).cloned()
+        self.0.lock().unwrap().tasks.get(id).cloned()
     }
 
     fn update_status(&self, id: &str, status: TaskStatus, output: Option<String>) -> bool {
         let mut guard = self.0.lock().unwrap();
-        if let Some(task) = guard.get_mut(id) {
+        if let Some(task) = guard.tasks.get_mut(id) {
             task.status = status;
             if let Some(out) = output {
                 task.output = Some(out);
             }
+            guard.save();
             true
         } else {
             false
@@ -84,7 +138,7 @@ impl TaskStore {
 
     fn list_all(&self) -> Vec<Task> {
         let guard = self.0.lock().unwrap();
-        let mut tasks: Vec<Task> = guard.values().cloned().collect();
+        let mut tasks: Vec<Task> = guard.tasks.values().cloned().collect();
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
         tasks
     }
@@ -257,5 +311,104 @@ impl Tool for TaskGetTool {
             out.push_str(&format!("Output:\n{output}\n"));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_and_get_task() {
+        let store = TaskStore::new();
+        store.insert(Task {
+            id: "task_1".to_string(),
+            title: "Test task".to_string(),
+            description: "desc".to_string(),
+            status: TaskStatus::Pending,
+            output: None,
+        });
+        let task = store.get("task_1").expect("task should exist");
+        assert_eq!(task.title, "Test task");
+        assert_eq!(task.status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn update_status() {
+        let store = TaskStore::new();
+        store.insert(Task {
+            id: "task_1".to_string(),
+            title: "T".to_string(),
+            description: String::new(),
+            status: TaskStatus::Pending,
+            output: None,
+        });
+        let updated = store.update_status("task_1", TaskStatus::Completed, Some("done".to_string()));
+        assert!(updated);
+        let task = store.get("task_1").unwrap();
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn update_nonexistent_returns_false() {
+        let store = TaskStore::new();
+        assert!(!store.update_status("ghost", TaskStatus::Completed, None));
+    }
+
+    #[test]
+    fn list_all_sorted() {
+        let store = TaskStore::new();
+        for (id, title) in [("task_2", "B"), ("task_1", "A"), ("task_3", "C")] {
+            store.insert(Task {
+                id: id.to_string(),
+                title: title.to_string(),
+                description: String::new(),
+                status: TaskStatus::Pending,
+                output: None,
+            });
+        }
+        let tasks = store.list_all();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks[0].id, "task_1");
+        assert_eq!(tasks[2].id, "task_3");
+    }
+
+    #[test]
+    fn next_id_increments() {
+        let store = TaskStore::new();
+        let id1 = store.next_id();
+        assert_eq!(id1, "task_1");
+        store.insert(Task {
+            id: id1,
+            title: "x".to_string(),
+            description: String::new(),
+            status: TaskStatus::Pending,
+            output: None,
+        });
+        assert_eq!(store.next_id(), "task_2");
+    }
+
+    #[test]
+    fn task_status_display() {
+        assert_eq!(TaskStatus::Pending.to_string(), "pending");
+        assert_eq!(TaskStatus::InProgress.to_string(), "in_progress");
+        assert_eq!(TaskStatus::Completed.to_string(), "completed");
+        assert_eq!(TaskStatus::Cancelled.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn clone_shares_state() {
+        let store = TaskStore::new();
+        let clone = store.clone();
+        store.insert(Task {
+            id: "task_1".to_string(),
+            title: "shared".to_string(),
+            description: String::new(),
+            status: TaskStatus::Pending,
+            output: None,
+        });
+        // Clone should see the same task (Arc-backed).
+        assert!(clone.get("task_1").is_some());
     }
 }

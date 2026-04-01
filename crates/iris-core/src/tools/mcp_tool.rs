@@ -20,8 +20,8 @@ use super::Tool;
 pub struct McpToolWrapper {
     pub server_name: String,
     client: Arc<McpClient>,
-    /// Lazy-initialised list of tool names exposed by this server.
-    tool_names: OnceCell<Vec<String>>,
+    /// Lazy-initialised list of tool names exposed by this server (reserved for future use).
+    _tool_names: OnceCell<Vec<String>>,
 }
 
 impl McpToolWrapper {
@@ -29,7 +29,7 @@ impl McpToolWrapper {
         Self {
             server_name: server_name.into(),
             client,
-            tool_names: OnceCell::new(),
+            _tool_names: OnceCell::new(),
         }
     }
 }
