@@ -13,6 +13,8 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -61,6 +63,8 @@ pub struct Agent {
     storage: Storage,
     /// Shared working-directory reference — injected into all I/O tools.
     pub cwd: CwdRef,
+    /// Set to true to interrupt the current streaming turn.
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -77,6 +81,7 @@ impl Agent {
             session,
             storage: Storage::new()?,
             cwd,
+            cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -94,6 +99,7 @@ impl Agent {
             session,
             storage: Storage::new()?,
             cwd,
+            cancel: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -117,6 +123,7 @@ impl Agent {
                 session,
                 storage: Storage::new()?,
                 cwd,
+                cancel: Arc::new(AtomicBool::new(false)),
             }
         } else if let Some(info) = detect_provider() {
             // 2. Google Gemini
@@ -133,6 +140,7 @@ impl Agent {
                     session,
                     storage: Storage::new()?,
                     cwd,
+                    cancel: Arc::new(AtomicBool::new(false)),
                 }
             // 3. Any other OpenAI-compat provider
             } else if info.name != "anthropic" && !key.is_empty() {
@@ -241,6 +249,7 @@ impl Agent {
         user_input: &str,
         mut on_text: impl FnMut(&str),
     ) -> Result<AgentResponse> {
+        self.cancel.store(false, Ordering::Relaxed);
         self.session.messages.push(Message::user(user_input));
 
         let mut response_text = String::new();
@@ -291,6 +300,10 @@ impl Agent {
                     };
 
                 while let Some(event) = stream.next().await {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        self.cancel.store(false, Ordering::Relaxed);
+                        break;
+                    }
                     match event? {
                         StreamEvent::TextDelta { text } => {
                             on_text(&text);

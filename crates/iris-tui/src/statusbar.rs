@@ -16,6 +16,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             format!(" git:({branch})"),
             Style::default().fg(Color::Rgb(100, 200, 100)),
         ),
+        Span::styled("  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.cwd_short.as_str(),
+            Style::default().fg(Color::Rgb(180, 180, 180)),
+        ),
         Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.model_name.as_str(),

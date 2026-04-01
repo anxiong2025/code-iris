@@ -76,12 +76,14 @@ async fn main() -> anyhow::Result<()> {
     let (tx_input, rx_input) = mpsc::channel::<WorkerCmd>(32);
     // agent worker → TUI
     let (tx_events, rx_events) = mpsc::unbounded_channel::<AgentEvent>();
+    // cancel channel (TUI → agent worker)
+    let (tx_cancel, rx_cancel) = mpsc::channel::<()>(4);
 
     // Spawn agent worker if any provider key is available.
     let session_id = match Agent::from_env() {
         Ok(agent) => {
             let id = agent.session.id.clone();
-            tokio::spawn(agent_worker(agent, rx_input, tx_events));
+            tokio::spawn(agent_worker(agent, rx_input, rx_cancel, tx_events));
             Some(id)
         }
         Err(_) => None,
@@ -93,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_event_loop(&mut terminal, tx_input, rx_events, session_id).await;
+    let result = run_event_loop(&mut terminal, tx_input, tx_cancel, rx_events, session_id).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -110,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
 async fn agent_worker(
     mut agent: Agent,
     mut rx_input: mpsc::Receiver<WorkerCmd>,
+    mut rx_cancel: mpsc::Receiver<()>,
     tx_events: mpsc::UnboundedSender<AgentEvent>,
 ) {
     agent = agent.with_permissions(PermissionMode::Auto);
@@ -157,25 +160,34 @@ async fn agent_worker(
                 let _ = tx_events.send(AgentEvent::System(msg));
             }
             WorkerCmd::UserInput(user_input) => {
+                agent.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                 let tx = tx_events.clone();
-                let result = agent
-                    .chat_streaming(&user_input, move |chunk| {
+                tokio::select! {
+                    result = agent.chat_streaming(&user_input, move |chunk| {
                         let _ = tx.send(AgentEvent::TextChunk(chunk.to_string()));
-                    })
-                    .await;
-
-                match result {
-                    Ok(resp) => {
-                        for tool in &resp.tool_calls {
-                            let _ = tx_events.send(AgentEvent::ToolCall(tool.clone()));
+                    }) => {
+                        match result {
+                            Ok(resp) => {
+                                for tool in &resp.tool_calls {
+                                    let _ = tx_events.send(AgentEvent::ToolCall(tool.clone()));
+                                }
+                                let _ = tx_events.send(AgentEvent::Done {
+                                    _tool_calls: resp.tool_calls,
+                                    usage: resp.usage,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx_events.send(AgentEvent::Error(err.to_string()));
+                            }
                         }
-                        let _ = tx_events.send(AgentEvent::Done {
-                            _tool_calls: resp.tool_calls,
-                            usage: resp.usage,
-                        });
                     }
-                    Err(err) => {
-                        let _ = tx_events.send(AgentEvent::Error(err.to_string()));
+                    Some(_) = rx_cancel.recv() => {
+                        agent.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx_events.send(AgentEvent::System("Interrupted.".to_string()));
+                        let _ = tx_events.send(AgentEvent::Done {
+                            _tool_calls: vec![],
+                            usage: iris_llm::TokenUsage::default(),
+                        });
                     }
                 }
             }
@@ -256,24 +268,70 @@ async fn agent_worker(
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     tx_input: mpsc::Sender<WorkerCmd>,
+    tx_cancel: mpsc::Sender<()>,
     mut rx_events: mpsc::UnboundedReceiver<AgentEvent>,
     session_id: Option<String>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(session_id);
     let mut key_stream = EventStream::new();
 
+    // Timer for animation ticks.
+    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+
     loop {
         terminal.draw(|frame| render(frame, &app))?;
 
         tokio::select! {
+            _ = tick_interval.tick() => {
+                // Send a tick event through the regular event channel via a local bump.
+                app.tick = app.tick.wrapping_add(1);
+            }
+
             Some(Ok(event)) = key_stream.next() => {
                 if let Event::Key(key) = event {
+                    // Ctrl+D → exit
                     if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+                        && key.code == KeyCode::Char('d')
                     {
                         return Ok(());
                     }
+                    // Ctrl+C → interrupt current turn (or exit if idle)
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if app.agent_state != AgentState::Idle {
+                            tx_cancel.try_send(()).ok();
+                        }
+                        // Clear input on Ctrl+C as well
+                        app.clear_input();
+                        continue;
+                    }
+                    // Ctrl+W → delete word before cursor
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('w')
+                    {
+                        app.delete_word_before();
+                        continue;
+                    }
+                    // Ctrl+A → home
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('a')
+                    {
+                        app.cursor_home();
+                        continue;
+                    }
+                    // Ctrl+E → end
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('e')
+                    {
+                        app.cursor_end();
+                        continue;
+                    }
+
                     match key.code {
+                        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            app.insert_newline();
+                        }
                         KeyCode::Enter => {
                             let input = app.take_input();
                             if matches!(input.trim(), "exit" | "quit") {
@@ -285,8 +343,36 @@ async fn run_event_loop(
                         }
                         KeyCode::Char(c) => app.push_char(c),
                         KeyCode::Backspace => app.pop_char(),
-                        KeyCode::Up => app.scroll_up(),
-                        KeyCode::Down => app.scroll_down(),
+                        KeyCode::Esc => {
+                            app.clear_input();
+                        }
+                        KeyCode::Up => {
+                            // If input is non-empty OR we're navigating history → history nav
+                            if !app.input.is_empty() || app.history_idx.is_some() {
+                                app.history_prev();
+                            } else {
+                                app.scroll_up();
+                            }
+                        }
+                        KeyCode::Down => {
+                            if app.history_idx.is_some() {
+                                app.history_next();
+                            } else {
+                                app.scroll_down();
+                            }
+                        }
+                        KeyCode::Left => {
+                            if !app.input.is_empty() {
+                                app.cursor_left();
+                            } else {
+                                // nothing to do when empty
+                            }
+                        }
+                        KeyCode::Right => {
+                            if !app.input.is_empty() {
+                                app.cursor_right();
+                            }
+                        }
                         KeyCode::PageUp => { for _ in 0..10 { app.scroll_up(); } }
                         KeyCode::PageDown => { for _ in 0..10 { app.scroll_down(); } }
                         _ => {}
@@ -300,6 +386,7 @@ async fn run_event_loop(
                     AgentEvent::ToolCall(name) => app.push_tool_call(&name),
                     AgentEvent::Done { _tool_calls: _, usage } => app.finish_response(&usage),
                     AgentEvent::System(msg) => app.push_system(msg),
+
                     AgentEvent::Error(err) => {
                         app.push_system(format!("Error: {err}"));
                         app.agent_state = AgentState::Idle;
@@ -381,7 +468,6 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                 }
             }
             "/compact" => {
-                // Send to worker — it will compress and reply via AgentEvent::System
                 if tx_input.send(WorkerCmd::Compact).await.is_err() {
                     app.push_system("Agent worker stopped unexpectedly.");
                 }
@@ -394,17 +480,13 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                 }
             }
             "/pwd" => {
-                // Ask the worker for current cwd.
-                if tx_input.send(WorkerCmd::ResetCwd).await.is_err() {
-                    // If it fails, just show process cwd.
-                }
+                if tx_input.send(WorkerCmd::ResetCwd).await.is_err() {}
                 let cwd = std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "unknown".to_string());
                 app.push_system(format!("Process cwd: {cwd}"));
             }
             "/commit" => {
-                // git commit with no message — show status
                 let output = std::process::Command::new("git")
                     .args(["status", "--short"])
                     .output();
@@ -489,7 +571,6 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
             "/agents" => {
                 use iris_core::agent_def::{builtin_agents, load_custom_agents, SandboxMode};
                 let mut lines = vec!["Available agent types:\n".to_string()];
-                // Custom agents from project/.iris/agents/ and ~/.code-iris/agents/
                 let custom = load_custom_agents(None);
                 if !custom.is_empty() {
                     lines.push("  Custom:".to_string());
@@ -538,7 +619,6 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
             _ if cmd.starts_with("/model ") => {
                 let m = cmd.trim_start_matches("/model ").trim().to_string();
                 app.model_name = m.clone();
-                // Send to worker so it takes effect on next turn
                 if tx_input.send(WorkerCmd::SetModel(m)).await.is_err() {
                     app.push_system("Agent worker stopped unexpectedly.");
                 }
@@ -565,9 +645,10 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
 
 fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let input_h = app.input_height();
     let layout = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(input_h),
         Constraint::Length(1),
     ])
     .split(area);
@@ -579,6 +660,9 @@ fn render(frame: &mut Frame, app: &App) {
     input::render(frame, layout[1], app);
     statusbar::render(frame, layout[2], app);
 }
+
+/// Spinner frames for the thinking indicator.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
@@ -597,17 +681,38 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Rgb(255, 140, 60)).bold(),
                 )));
                 for md_line in markdown::render_markdown(&entry.content) {
-                    // indent by 2 spaces
                     let mut indented = vec![Span::raw("  ")];
                     indented.extend(md_line.spans);
                     lines.push(Line::from(indented));
                 }
             }
             ChatRole::Tool => {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", entry.content),
-                    Style::default().fg(Color::Rgb(150, 150, 255)).italic(),
-                )));
+                // Parse tool name and content preview from "⚙  tool_name" format.
+                let raw = entry.content.trim_start_matches('⚙').trim();
+                // raw is e.g. "bash" or "bash\narg..." depending on push_tool_call
+                let (tool_name, preview) = if let Some(nl) = raw.find('\n') {
+                    (&raw[..nl], raw[nl + 1..].trim())
+                } else {
+                    (raw, "")
+                };
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled("⟩ ", Style::default().fg(Color::Rgb(100, 150, 255))),
+                    Span::styled(
+                        tool_name.to_string(),
+                        Style::default().fg(Color::Rgb(100, 150, 255)).bold(),
+                    ),
+                ];
+                if !preview.is_empty() {
+                    let truncated: String = preview.chars().take(80).collect();
+                    let ellipsis = if preview.chars().count() > 80 { "…" } else { "" };
+                    spans.push(Span::raw("  "));
+                    spans.push(Span::styled(
+                        format!("{truncated}{ellipsis}"),
+                        Style::default().fg(Color::Rgb(120, 120, 120)).italic(),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
             ChatRole::System => {
                 lines.push(Line::from(Span::styled(
@@ -621,16 +726,22 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
 
     match app.agent_state {
         AgentState::Thinking => {
-            lines.push(Line::from(Span::styled(
-                "  thinking…",
-                Style::default().fg(Color::Rgb(150, 150, 150)).italic(),
-            )));
+            let frame_char = SPINNER[app.tick as usize % SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{frame_char} thinking…"),
+                    Style::default().fg(Color::Rgb(150, 150, 150)).italic(),
+                ),
+            ]));
         }
         AgentState::Streaming => {
-            lines.push(Line::from(Span::styled(
-                "  ▋",
-                Style::default().fg(Color::Rgb(255, 140, 60)),
-            )));
+            let frame_char = SPINNER[app.tick as usize % SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(frame_char, Style::default().fg(Color::Rgb(255, 140, 60))),
+                Span::styled(" ▋", Style::default().fg(Color::Rgb(255, 140, 60))),
+            ]));
         }
         AgentState::Idle => {}
     }

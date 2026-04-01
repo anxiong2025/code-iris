@@ -1,24 +1,37 @@
-//! Lightweight Markdown → ratatui Lines renderer.
+//! Lightweight Markdown → ratatui Lines renderer with syntax highlighting.
 //!
 //! Handles the most common patterns in LLM output:
 //!
 //! - `# / ## / ###` headings
 //! - `**bold**` and `*italic*`
 //! - `` `inline code` ``
-//! - ` ```code blocks``` ` (fenced)
+//! - ` ```lang\n...\n``` ` fenced code blocks (with syntect highlighting)
 //! - `- / * / 1.` list items
 //! - `>` blockquotes
+//! - `---` horizontal rules
 //! - Plain text (with inline span parsing)
 
+use std::sync::LazyLock;
+
 use ratatui::prelude::*;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+
+// ── Syntect globals (initialised once) ───────────────────────────────────────
+
+static SS: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static TS: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 // ── Colour palette ────────────────────────────────────────────────────────────
 
 const C_HEADING1: Color = Color::Rgb(255, 200, 80);
 const C_HEADING2: Color = Color::Rgb(230, 180, 60);
 const C_HEADING3: Color = Color::Rgb(200, 160, 50);
-const C_CODE_BG: Color = Color::Rgb(40, 40, 50);
+const C_CODE_BG: Color = Color::Rgb(30, 32, 40);
 const C_CODE_FG: Color = Color::Rgb(180, 230, 180);
+const C_CODE_BORDER: Color = Color::Rgb(70, 75, 100);
+const C_CODE_LANG: Color = Color::Rgb(130, 140, 200);
 const C_QUOTE: Color = Color::Rgb(150, 150, 180);
 const C_BULLET: Color = Color::Rgb(100, 200, 100);
 const C_BOLD: Color = Color::Rgb(255, 255, 255);
@@ -33,27 +46,26 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut in_code_block = false;
     let mut code_lang = String::new();
+    let mut code_buf: Vec<String> = Vec::new();
 
     for raw_line in text.lines() {
         // ── Fenced code block toggle ──────────────────────────────────────────
         if raw_line.starts_with("```") {
             if in_code_block {
-                in_code_block = false;
+                // Flush buffered code block with highlighting.
+                lines.extend(render_code_block(&code_lang, &code_buf));
+                code_buf.clear();
                 code_lang.clear();
-                // closing fence — add a blank line for breathing room
-                lines.push(Line::from(""));
+                in_code_block = false;
             } else {
                 in_code_block = true;
-                code_lang = raw_line.trim_start_matches('`').to_string();
+                code_lang = raw_line.trim_start_matches('`').trim().to_string();
             }
             continue;
         }
 
         if in_code_block {
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {raw_line}"),
-                Style::default().fg(C_CODE_FG).bg(C_CODE_BG),
-            )]));
+            code_buf.push(raw_line.to_string());
             continue;
         }
 
@@ -140,7 +152,98 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
         lines.push(Line::from(parse_inline(raw_line)));
     }
 
+    // Unclosed code block at end of streamed text — flush as-is.
+    if in_code_block && !code_buf.is_empty() {
+        lines.extend(render_code_block(&code_lang, &code_buf));
+    }
+
     lines
+}
+
+// ── Code block renderer ───────────────────────────────────────────────────────
+
+fn render_code_block(lang: &str, code_lines: &[String]) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Header bar: ╭─ rust ──────────
+    let lang_badge = if lang.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", lang)
+    };
+    out.push(Line::from(vec![
+        Span::styled("  ╭─", Style::default().fg(C_CODE_BORDER)),
+        Span::styled(lang_badge, Style::default().fg(C_CODE_LANG).bold()),
+        Span::styled("─", Style::default().fg(C_CODE_BORDER)),
+    ]));
+
+    // Try syntect highlighting.
+    let highlighted = try_highlight(lang, code_lines);
+
+    if let Some(hl_lines) = highlighted {
+        for hl in hl_lines {
+            let mut spans = vec![Span::styled("  │ ", Style::default().fg(C_CODE_BORDER))];
+            spans.extend(hl);
+            out.push(Line::from(spans));
+        }
+    } else {
+        // Fallback: plain green.
+        for line in code_lines {
+            out.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(C_CODE_BORDER)),
+                Span::styled(line.clone(), Style::default().fg(C_CODE_FG).bg(C_CODE_BG)),
+            ]));
+        }
+    }
+
+    // Footer bar.
+    out.push(Line::from(vec![
+        Span::styled("  ╰──────────", Style::default().fg(C_CODE_BORDER)),
+    ]));
+    out.push(Line::from(""));
+
+    out
+}
+
+/// Attempt syntect highlighting. Returns `None` if the language is unknown.
+fn try_highlight(lang: &str, code_lines: &[String]) -> Option<Vec<Vec<Span<'static>>>> {
+    let syntax = if lang.is_empty() {
+        return None;
+    } else {
+        SS.find_syntax_by_token(lang)?
+    };
+
+    let theme = TS.themes.get("base16-ocean.dark")?;
+    let mut h = HighlightLines::new(syntax, theme);
+    let mut result: Vec<Vec<Span<'static>>> = Vec::new();
+
+    for raw in code_lines {
+        let line_with_nl = format!("{raw}\n");
+        let ranges = h.highlight_line(&line_with_nl, &SS).ok()?;
+
+        let spans: Vec<Span<'static>> = ranges
+            .iter()
+            .filter_map(|(style, text)| {
+                let t = text.trim_end_matches('\n');
+                if t.is_empty() {
+                    return None;
+                }
+                let fg = Color::Rgb(
+                    style.foreground.r,
+                    style.foreground.g,
+                    style.foreground.b,
+                );
+                Some(Span::styled(
+                    t.to_string(),
+                    Style::default().fg(fg).bg(C_CODE_BG),
+                ))
+            })
+            .collect();
+
+        result.push(spans);
+    }
+
+    Some(result)
 }
 
 // ── Inline span parser ────────────────────────────────────────────────────────
@@ -155,10 +258,7 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
     macro_rules! flush {
         () => {
             if !buf.is_empty() {
-                spans.push(Span::styled(
-                    buf.clone(),
-                    Style::default().fg(C_TEXT),
-                ));
+                spans.push(Span::styled(buf.clone(), Style::default().fg(C_TEXT)));
                 buf.clear();
             }
         };
@@ -178,7 +278,9 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
                 format!(" {code} "),
                 Style::default().fg(C_INLINE_CODE).bg(C_CODE_BG),
             ));
-            if i < chars.len() { i += 1; }
+            if i < chars.len() {
+                i += 1;
+            }
             continue;
         }
 
@@ -191,11 +293,10 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
                 i += 1;
             }
             let bold: String = chars[start..i].iter().collect();
-            spans.push(Span::styled(
-                bold,
-                Style::default().fg(C_BOLD).bold(),
-            ));
-            if i + 1 < chars.len() { i += 2; }
+            spans.push(Span::styled(bold, Style::default().fg(C_BOLD).bold()));
+            if i + 1 < chars.len() {
+                i += 2;
+            }
             continue;
         }
 
@@ -208,11 +309,10 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
                 i += 1;
             }
             let italic: String = chars[start..i].iter().collect();
-            spans.push(Span::styled(
-                italic,
-                Style::default().fg(C_ITALIC).italic(),
-            ));
-            if i < chars.len() { i += 1; }
+            spans.push(Span::styled(italic, Style::default().fg(C_ITALIC).italic()));
+            if i < chars.len() {
+                i += 1;
+            }
             continue;
         }
 
@@ -254,19 +354,28 @@ mod tests {
     fn render_fenced_code_block() {
         let src = "```rust\nfn main() {}\n```";
         let lines = render_markdown(src);
-        // Opening fence is consumed; code line rendered; closing fence adds blank
+        // header + code line + footer + blank
         assert!(!lines.is_empty());
-        let code_line = lines.iter().find(|l| {
-            l.spans.iter().any(|s| s.content.contains("fn main"))
-        });
-        assert!(code_line.is_some(), "code line not found");
+        let all_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(all_text.contains("fn main"), "code not found in: {all_text}");
+    }
+
+    #[test]
+    fn render_code_block_has_header_footer() {
+        let lines = render_code_block("rust", &["let x = 1;".to_string()]);
+        let all: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
+        assert!(all.contains('╭'), "missing header: {all}");
+        assert!(all.contains('╰'), "missing footer: {all}");
     }
 
     #[test]
     fn render_unordered_list() {
         let lines = render_markdown("- item one\n- item two");
         assert_eq!(lines.len(), 2);
-        // Each line should contain the bullet character
         for line in &lines {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             assert!(text.contains('•'), "bullet missing in: {text}");
@@ -276,7 +385,6 @@ mod tests {
     #[test]
     fn render_blank_line() {
         let lines = render_markdown("a\n\nb");
-        // a, blank, b
         assert_eq!(lines.len(), 3);
     }
 
@@ -307,5 +415,13 @@ mod tests {
         let spans = parse_inline("hello world");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn unclosed_code_block_at_eof() {
+        // Streaming text may end without closing fence — should not panic.
+        let src = "```rust\nfn foo() {";
+        let lines = render_markdown(src);
+        assert!(!lines.is_empty());
     }
 }
