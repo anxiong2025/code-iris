@@ -23,7 +23,7 @@ use iris_core::context::{compress, ContextConfig};
 use iris_core::permissions::PermissionMode;
 use iris_core::reporter::Reporter;
 use iris_core::storage::Storage;
-use iris_llm::PROVIDERS;
+use iris_llm::{clear_credentials, login, PROVIDERS};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -69,6 +69,12 @@ enum Command {
     /// Interactive API-key configuration wizard.
     Configure,
 
+    /// Login with your Claude.ai account (OAuth — no API key required).
+    Login,
+
+    /// Logout and remove stored OAuth credentials.
+    Logout,
+
     /// List all supported LLM providers and their configuration status.
     Models,
 
@@ -110,6 +116,8 @@ async fn main() -> Result<()> {
         Command::Deps { path } => cmd_deps(resolve_path(path))?,
         Command::Stats { path } => cmd_stats(resolve_path(path))?,
         Command::Configure => configure_interactive()?,
+        Command::Login => cmd_login().await?,
+        Command::Logout => cmd_logout()?,
         Command::Models => cmd_models(),
         Command::Chat { model, resume, auto, plan } => {
             cmd_chat(model, resume, auto, plan).await?
@@ -316,6 +324,24 @@ Slash commands:
 
         other => format!("Unknown command: {other}  (try /help)"),
     })
+}
+
+async fn cmd_login() -> Result<()> {
+    let client = reqwest::Client::builder()
+        .use_rustls_tls()
+        .build()
+        .context("failed to build HTTP client")?;
+    let tokens = login(&client).await?;
+    println!("\nLogged in successfully.");
+    println!("Access token expires at: {} (unix)", tokens.expires_at);
+    println!("Run `iris chat` to start a session — no API key needed.");
+    Ok(())
+}
+
+fn cmd_logout() -> Result<()> {
+    clear_credentials()?;
+    println!("Logged out. OAuth credentials removed.");
+    Ok(())
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────

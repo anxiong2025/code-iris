@@ -91,12 +91,13 @@ impl Agent {
     /// Auto-detect provider from environment variables and create an agent.
     ///
     /// Priority: OAuth credentials → ANTHROPIC_API_KEY → first set env key among all providers.
+    /// Also loads MCP servers from ~/.code-iris/config.toml and registers their tools.
     pub fn from_env() -> Result<Self> {
         use iris_llm::{detect_provider, AuthSource, PROVIDERS};
 
         // 1. OAuth / Anthropic API key
-        if let Some(auth) = AuthSource::from_env() {
-            return Ok(Self {
+        let mut agent = if let Some(auth) = AuthSource::from_env() {
+            Self {
                 provider: LlmProvider::Anthropic(AnthropicProvider::with_auth_pub(auth)),
                 config: ModelConfig::new("claude-sonnet-4-6-20250514"),
                 tools: ToolRegistry::default_registry(),
@@ -104,28 +105,66 @@ impl Agent {
                 permissions: PermissionMode::Default,
                 session: new_session(),
                 storage: Storage::new()?,
-            });
-        }
-
-        // 2. Any other configured provider
-        if let Some(info) = detect_provider() {
+            }
+        } else if let Some(info) = detect_provider() {
+            // 2. Any other configured provider
             let key = std::env::var(info.env_key).unwrap_or_default();
-            // Skip "anthropic" here (already handled above)
             if info.name != "anthropic" && !key.is_empty() {
                 let compat = OpenAiCompatProvider::new(
-                    info.name,
-                    key,
-                    info.base_url,
-                    info.default_model,
+                    info.name, key, info.base_url, info.default_model,
                 );
-                return Self::new_openai_compat(compat);
+                Self::new_openai_compat(compat)?
+            } else {
+                anyhow::bail!(
+                    "No API key found. Set one of: {}\nor run `iris configure`.",
+                    PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
+                )
             }
-        }
+        } else {
+            anyhow::bail!(
+                "No API key found. Set one of: {}\nor run `iris configure`.",
+                PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
+            )
+        };
 
-        anyhow::bail!(
-            "No API key found. Set one of: {}\nor run `iris configure`.",
-            PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
-        )
+        // 3. Load MCP servers from config and register their tools.
+        agent.load_mcp_tools();
+        Ok(agent)
+    }
+
+    /// Load MCP server configs from ~/.code-iris/config.toml and register tools.
+    ///
+    /// Errors are logged as warnings — a missing/broken MCP server should not
+    /// prevent the agent from starting.
+    fn load_mcp_tools(&mut self) {
+        use crate::config::load_config;
+        use crate::tools::mcp_tool::McpToolWrapper;
+        use iris_llm::{McpClient, McpServerConfig};
+        use std::sync::Arc;
+
+        let config = match load_config() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("failed to load config: {e}");
+                return;
+            }
+        };
+
+        for server_cfg in &config.mcp_servers {
+            let transport = match server_cfg.to_transport() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(server = %server_cfg.name, "invalid MCP transport: {e}");
+                    continue;
+                }
+            };
+            let client = Arc::new(McpClient::new(transport));
+            // We can't await here (sync context), so we register a lazy wrapper
+            // that will fetch tool definitions on first use.
+            let wrapper = McpToolWrapper::new(server_cfg.name.clone(), client);
+            self.tools.register(Arc::new(wrapper));
+            tracing::info!(server = %server_cfg.name, "registered MCP server");
+        }
     }
 
     // ── Builder methods ───────────────────────────────────────────────────────

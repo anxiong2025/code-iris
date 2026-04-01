@@ -921,6 +921,7 @@ dependencies = [
  "dotenvy",
  "iris-core",
  "iris-llm",
+ "reqwest",
  "serde_json",
  "tokio",
  "tracing",

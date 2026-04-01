@@ -29,7 +29,18 @@ mod welcome;
 
 use app::{AgentEvent, AgentState, App, AppMode, ChatRole};
 use iris_core::agent::Agent;
+use iris_core::context::compress;
 use iris_core::permissions::PermissionMode;
+
+/// Commands sent from the TUI event loop to the agent worker.
+enum WorkerCmd {
+    /// User typed a message — run agent.chat_streaming().
+    UserInput(String),
+    /// /model <name> — switch model for next turn.
+    SetModel(String),
+    /// /compact — manually trigger context compression.
+    Compact,
+}
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -45,20 +56,19 @@ async fn main() -> anyhow::Result<()> {
         .try_init()
         .ok();
 
-    // user input → agent worker
-    let (tx_input, rx_input) = mpsc::channel::<String>(32);
+    // TUI → agent worker
+    let (tx_input, rx_input) = mpsc::channel::<WorkerCmd>(32);
     // agent worker → TUI
     let (tx_events, rx_events) = mpsc::unbounded_channel::<AgentEvent>();
 
-    // Spawn agent worker only when API key is available.
-    let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let session_id = if api_key.trim().is_empty() {
-        None
-    } else {
-        let agent = Agent::new(&api_key)?;
-        let id = agent.session.id.clone();
-        tokio::spawn(agent_worker(agent, rx_input, tx_events));
-        Some(id)
+    // Spawn agent worker if any provider key is available.
+    let session_id = match Agent::from_env() {
+        Ok(agent) => {
+            let id = agent.session.id.clone();
+            tokio::spawn(agent_worker(agent, rx_input, tx_events));
+            Some(id)
+        }
+        Err(_) => None,
     };
 
     enable_raw_mode()?;
@@ -83,31 +93,49 @@ async fn main() -> anyhow::Result<()> {
 
 async fn agent_worker(
     mut agent: Agent,
-    mut rx_input: mpsc::Receiver<String>,
+    mut rx_input: mpsc::Receiver<WorkerCmd>,
     tx_events: mpsc::UnboundedSender<AgentEvent>,
 ) {
     agent = agent.with_permissions(PermissionMode::Auto);
 
-    while let Some(user_input) = rx_input.recv().await {
-        let tx = tx_events.clone();
-        let result = agent
-            .chat_streaming(&user_input, move |chunk| {
-                let _ = tx.send(AgentEvent::TextChunk(chunk.to_string()));
-            })
-            .await;
-
-        match result {
-            Ok(resp) => {
-                for tool in &resp.tool_calls {
-                    let _ = tx_events.send(AgentEvent::ToolCall(tool.clone()));
-                }
-                let _ = tx_events.send(AgentEvent::Done {
-                    _tool_calls: resp.tool_calls,
-                    usage: resp.usage,
-                });
+    while let Some(cmd) = rx_input.recv().await {
+        match cmd {
+            WorkerCmd::SetModel(model) => {
+                agent = agent.with_model(&model);
+                let _ = tx_events.send(AgentEvent::System(format!("Model switched to: {model}")));
             }
-            Err(err) => {
-                let _ = tx_events.send(AgentEvent::Error(err.to_string()));
+            WorkerCmd::Compact => {
+                let cfg = iris_core::context::ContextConfig::default();
+                let changed = compress(&mut agent.session.messages, &cfg);
+                let msg = if changed {
+                    format!("Compacted — {} messages kept.", agent.session.messages.len())
+                } else {
+                    "Context is within limits, nothing to compact.".to_string()
+                };
+                let _ = tx_events.send(AgentEvent::System(msg));
+            }
+            WorkerCmd::UserInput(user_input) => {
+                let tx = tx_events.clone();
+                let result = agent
+                    .chat_streaming(&user_input, move |chunk| {
+                        let _ = tx.send(AgentEvent::TextChunk(chunk.to_string()));
+                    })
+                    .await;
+
+                match result {
+                    Ok(resp) => {
+                        for tool in &resp.tool_calls {
+                            let _ = tx_events.send(AgentEvent::ToolCall(tool.clone()));
+                        }
+                        let _ = tx_events.send(AgentEvent::Done {
+                            _tool_calls: resp.tool_calls,
+                            usage: resp.usage,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx_events.send(AgentEvent::Error(err.to_string()));
+                    }
+                }
             }
         }
     }
@@ -117,7 +145,7 @@ async fn agent_worker(
 
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    tx_input: mpsc::Sender<String>,
+    tx_input: mpsc::Sender<WorkerCmd>,
     mut rx_events: mpsc::UnboundedReceiver<AgentEvent>,
     session_id: Option<String>,
 ) -> anyhow::Result<()> {
@@ -161,6 +189,7 @@ async fn run_event_loop(
                     AgentEvent::TextChunk(chunk) => app.append_assistant_chunk(&chunk),
                     AgentEvent::ToolCall(name) => app.push_tool_call(&name),
                     AgentEvent::Done { _tool_calls: _, usage } => app.finish_response(&usage),
+                    AgentEvent::System(msg) => app.push_system(msg),
                     AgentEvent::Error(err) => {
                         app.push_system(format!("Error: {err}"));
                         app.agent_state = AgentState::Idle;
@@ -171,15 +200,13 @@ async fn run_event_loop(
     }
 }
 
-async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender<String>) {
+async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender<WorkerCmd>) {
     // ── Slash commands ────────────────────────────────────────────────────────
     if input.starts_with('/') {
         let cmd = input.trim();
         match cmd {
             "/help" => {
-                app.push_system(
-                    "/help  /clear  /session  /model  /compact  exit|quit",
-                );
+                app.push_system("/help  /clear  /session  /model [name]  /compact  exit|quit");
             }
             "/clear" => {
                 app.chat_history.clear();
@@ -194,15 +221,21 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                 }
             }
             "/model" => {
-                app.push_system(format!("Model: {}", app.model_name));
+                app.push_system(format!("Current model: {}", app.model_name));
             }
             "/compact" => {
-                app.push_system("Autocompact will run on next turn when context is large.");
+                // Send to worker — it will compress and reply via AgentEvent::System
+                if tx_input.send(WorkerCmd::Compact).await.is_err() {
+                    app.push_system("Agent worker stopped unexpectedly.");
+                }
             }
             _ if cmd.starts_with("/model ") => {
                 let m = cmd.trim_start_matches("/model ").trim().to_string();
                 app.model_name = m.clone();
-                app.push_system(format!("Model set to: {m}"));
+                // Send to worker so it takes effect on next turn
+                if tx_input.send(WorkerCmd::SetModel(m)).await.is_err() {
+                    app.push_system("Agent worker stopped unexpectedly.");
+                }
             }
             _ => {
                 app.push_system(format!("Unknown command: {cmd}  (type /help)"));
@@ -212,11 +245,11 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
     }
 
     if !app.has_api_key {
-        app.push_system("ANTHROPIC_API_KEY not set — restart with the key exported.");
+        app.push_system("No API key found — set ANTHROPIC_API_KEY or DASHSCOPE_API_KEY etc.");
         return;
     }
     app.push_user(&input);
-    if tx_input.send(input).await.is_err() {
+    if tx_input.send(WorkerCmd::UserInput(input)).await.is_err() {
         app.push_system("Agent worker stopped unexpectedly.");
         app.agent_state = AgentState::Idle;
     }

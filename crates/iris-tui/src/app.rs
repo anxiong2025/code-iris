@@ -18,6 +18,8 @@ pub enum AgentEvent {
     ToolCall(String),
     /// The agent finished a full exchange.
     Done { _tool_calls: Vec<String>, usage: TokenUsage },
+    /// A system/status message from the worker (model switch, compact result, etc.).
+    System(String),
     /// The agent encountered an error.
     Error(String),
 }

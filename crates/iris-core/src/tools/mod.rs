@@ -14,6 +14,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod glob;
 pub mod grep;
+pub mod mcp_tool;
 pub mod send_message;
 pub mod task;
 pub mod web_fetch;

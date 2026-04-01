@@ -17,6 +17,9 @@ clap.workspace = true
 # Async
 tokio.workspace = true
 
+# HTTP (for iris login OAuth flow)
+reqwest.workspace = true
+
 # Serialization
 serde_json.workspace = true
 

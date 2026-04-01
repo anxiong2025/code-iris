@@ -4,10 +4,23 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub use iris_llm::McpServerConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IrisConfig {
     pub default_provider: Option<String>,
     pub default_model: Option<String>,
+    /// MCP servers to connect on startup.
+    ///
+    /// Example in ~/.code-iris/config.toml:
+    /// ```toml
+    /// [[mcp_servers]]
+    /// name = "filesystem"
+    /// command = "npx"
+    /// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    /// ```
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl IrisConfig {
