@@ -248,7 +248,9 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                 app.push_system(
                     "/help  /clear  /session  /sessions  /resume <id>\n  \
                      /model [name]  /compact  /commit [msg]  /memory [note]\n  \
-                     /cd <path>  /pwd  /worktree <branch>  exit|quit"
+                     /cd <path>  /pwd  /worktree <branch>\n  \
+                     /agents                list available agent types\n  \
+                     exit|quit"
                 );
             }
             "/clear" => {
@@ -382,6 +384,37 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                     Err(e) => app.push_system(format!("git error: {e}")),
                 }
             }
+            "/agents" => {
+                use iris_core::agent_def::{builtin_agents, load_custom_agents, SandboxMode};
+                let mut lines = vec!["Available agent types:\n".to_string()];
+                // Custom agents from project/.iris/agents/ and ~/.code-iris/agents/
+                let custom = load_custom_agents(None);
+                if !custom.is_empty() {
+                    lines.push("  Custom:".to_string());
+                    for def in &custom {
+                        let mode = match def.sandbox_mode {
+                            SandboxMode::ReadOnly => "read-only",
+                            SandboxMode::Full => "full",
+                        };
+                        let model_hint = def.model.as_deref().unwrap_or("inherit");
+                        lines.push(format!("  • {} [{}] ({}) — {}", def.name, mode, model_hint, def.description));
+                    }
+                    lines.push(String::new());
+                }
+                lines.push("  Built-in:".to_string());
+                for def in builtin_agents() {
+                    let mode = match def.sandbox_mode {
+                        SandboxMode::ReadOnly => "read-only",
+                        SandboxMode::Full => "full",
+                    };
+                    let model_hint = def.model.as_deref().unwrap_or("inherit");
+                    lines.push(format!("  • {} [{}] ({}) — {}", def.name, mode, model_hint, def.description));
+                }
+                lines.push(String::new());
+                lines.push("Use in CLI: iris run --pipeline --sub \"step@explorer:prompt\"".to_string());
+                app.push_system(lines.join("\n"));
+            }
+
             _ if cmd.starts_with("/resume ") => {
                 let id = cmd.trim_start_matches("/resume ").trim().to_string();
                 if tx_input.send(WorkerCmd::LoadSession(id)).await.is_err() {

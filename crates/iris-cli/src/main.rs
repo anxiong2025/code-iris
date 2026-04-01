@@ -21,8 +21,8 @@ use iris_core::agent::Agent;
 use iris_core::config::{configure_interactive, load_config, user_env_path};
 use iris_core::coordinator::{Coordinator, PipelineStep, SubTask};
 use iris_core::memory as iris_memory;
-use iris_core::context::{compress, ContextConfig};
 use iris_core::permissions::PermissionMode;
+use iris_core::context::{compress, ContextConfig};
 use iris_core::reporter::Reporter;
 use iris_core::storage::Storage;
 use iris_llm::{clear_credentials, login, PROVIDERS};
@@ -97,6 +97,35 @@ enum Command {
         pipeline: bool,
     },
 
+    /// Auto-plan a feature using a three-step pipeline: Product → Arch → Code.
+    ///
+    /// Example: iris plan "add JWT authentication to the REST API"
+    Plan {
+        /// Feature or requirement to plan.
+        prompt: String,
+        /// Override the model.
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Stop after the architecture step (no code generation).
+        #[arg(long)]
+        arch_only: bool,
+    },
+
+    /// Detect documentation drift — find .md sections made stale by recent code changes.
+    ///
+    /// Example: iris doc-sync
+    ///          iris doc-sync --since HEAD~3
+    DocSync {
+        /// Git ref to diff against (default: HEAD~1).
+        #[arg(long, default_value = "HEAD~1")]
+        since: String,
+        /// Path to the project root (defaults to current directory).
+        path: Option<PathBuf>,
+        /// Override the model.
+        #[arg(short, long)]
+        model: Option<String>,
+    },
+
     /// Start an interactive AI agent session (streaming).
     Chat {
         /// Override the model (e.g. `claude-opus-4-6-20250514`).
@@ -143,6 +172,8 @@ async fn main() -> Result<()> {
         Command::Logout => cmd_logout()?,
         Command::Models => cmd_models(),
         Command::Run { prompt, subs, model, pipeline } => cmd_run(prompt, subs, model, pipeline).await?,
+        Command::Plan { prompt, model, arch_only } => cmd_plan(prompt, model, arch_only).await?,
+        Command::DocSync { since, path, model } => cmd_doc_sync(since, resolve_path(path), model).await?,
         Command::Chat { model, resume, auto, plan } => {
             cmd_chat(model, resume, auto, plan).await?
         }
@@ -338,6 +369,202 @@ async fn cmd_run(
     );
 
     Ok(())
+}
+
+// ── iris plan ─────────────────────────────────────────────────────────────────
+
+async fn cmd_plan(prompt: String, model: Option<String>, arch_only: bool) -> Result<()> {
+    let mut coord = Coordinator::from_env();
+    if let Some(m) = &model {
+        coord = coord.with_model(m);
+    }
+
+    let mut steps = vec![
+        PipelineStep {
+            label: "product".to_string(),
+            agent_type: Some("explorer".to_string()),
+            system_prompt: String::new(),
+            prompt: format!(
+                "You are a product thinker. Analyse this requirement and output a structured breakdown:\n\
+                 - Problem statement\n\
+                 - Target users and their needs\n\
+                 - Acceptance criteria (bullet list)\n\
+                 - Constraints and risks\n\n\
+                 Requirement: {prompt}"
+            ),
+        },
+        PipelineStep {
+            label: "architecture".to_string(),
+            agent_type: Some("reviewer".to_string()),
+            system_prompt: String::new(),
+            prompt: "Based on the product analysis above, produce a technical architecture plan:\n\
+                     - Component breakdown (which files/modules to create or modify)\n\
+                     - Interface design (function signatures, data structures)\n\
+                     - Dependencies and integration points\n\
+                     - Potential risks and mitigations"
+                .to_string(),
+        },
+    ];
+
+    if !arch_only {
+        steps.push(PipelineStep {
+            label: "implementation".to_string(),
+            agent_type: Some("worker".to_string()),
+            system_prompt: String::new(),
+            prompt: "Based on the product analysis and architecture above, generate the implementation:\n\
+                     - Write the actual code for each component\n\
+                     - Include file paths and complete function bodies\n\
+                     - Add necessary tests\n\
+                     - Note any follow-up tasks"
+                .to_string(),
+        });
+    }
+
+    let step_count = steps.len();
+    eprintln!("\x1b[1miris plan\x1b[0m · {} steps\n", step_count);
+
+    let results = coord.pipeline_run(steps).await?;
+
+    let mut total_in = 0u32;
+    let mut total_out = 0u32;
+    for result in &results {
+        let icon = match result.label.as_str() {
+            "product" => "📋",
+            "architecture" => "🏗",
+            "implementation" => "⚙",
+            _ => "▸",
+        };
+        println!("\x1b[1m{icon} {}\x1b[0m\n", result.label.to_uppercase());
+        println!("{}\n", result.text);
+        println!("{}", "─".repeat(60));
+        println!();
+        total_in += result.usage.input_tokens;
+        total_out += result.usage.output_tokens;
+    }
+    eprintln!("\x1b[90m[total tokens in={total_in} out={total_out}]\x1b[0m");
+
+    Ok(())
+}
+
+// ── iris doc-sync ─────────────────────────────────────────────────────────────
+
+async fn cmd_doc_sync(since: String, path: PathBuf, model: Option<String>) -> Result<()> {
+    // 1. Get the git diff.
+    let diff_output = std::process::Command::new("git")
+        .args(["diff", &since, "--", "*.rs", "*.go", "*.py", "*.ts", "*.js"])
+        .current_dir(&path)
+        .output();
+
+    let diff = match diff_output {
+        Ok(o) if !o.stdout.is_empty() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(_) => {
+            println!("No code changes found since {since}.");
+            return Ok(());
+        }
+        Err(e) => {
+            anyhow::bail!("git diff failed: {e}. Is this a git repository?");
+        }
+    };
+
+    // 2. Collect all .md files.
+    let md_files = collect_md_files(&path);
+    if md_files.is_empty() {
+        println!("No .md files found in {}.", path.display());
+        return Ok(());
+    }
+
+    let mut docs_content = String::new();
+    for md_path in &md_files {
+        if let Ok(content) = std::fs::read_to_string(md_path) {
+            let rel = md_path.strip_prefix(&path).unwrap_or(md_path);
+            docs_content.push_str(&format!("### File: {}\n\n{}\n\n---\n\n", rel.display(), content));
+        }
+    }
+
+    eprintln!(
+        "\x1b[1miris doc-sync\x1b[0m · {} .md files · diff since {since}\n",
+        md_files.len()
+    );
+
+    // 3. Run a single agent to detect drift.
+    let mut agent = Agent::from_env()
+        .context("No API key found. Run `iris configure`.")?;
+    if let Some(m) = model {
+        agent = agent.with_model(m);
+    }
+    agent = agent.with_permissions(iris_core::permissions::PermissionMode::Auto);
+
+    let prompt = format!(
+        "You are a documentation auditor. Below is a git diff of recent code changes, \
+         followed by all the project's Markdown documentation.\n\n\
+         Your task: identify documentation sections that are now STALE or INCORRECT \
+         because of the code changes. For each issue found:\n\
+         - Cite the exact file and approximate line number\n\
+         - Quote the outdated text (one sentence max)\n\
+         - Explain what changed in the code that made it stale\n\
+         - Suggest the corrected text\n\n\
+         If no documentation is stale, say so clearly.\n\n\
+         ## Code diff (since {since})\n\n\
+         ```diff\n{diff}\n```\n\n\
+         ## Documentation files\n\n{docs_content}"
+    );
+
+    print!("\x1b[33miris\x1b[0m  ");
+    io::stdout().flush()?;
+
+    let response = agent
+        .chat_streaming(&prompt, |chunk| {
+            print!("{chunk}");
+            io::stdout().flush().ok();
+        })
+        .await?;
+
+    if !response.text.ends_with('\n') {
+        println!();
+    }
+    eprintln!(
+        "\n\x1b[90m[tokens in={} out={}]\x1b[0m",
+        response.usage.input_tokens, response.usage.output_tokens
+    );
+
+    Ok(())
+}
+
+fn collect_md_files(root: &PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let walker = walkdir_collect(root);
+    for entry in walker {
+        if entry.extension().and_then(|e| e.to_str()) == Some("md") {
+            // Skip hidden dirs and target/.
+            let path_str = entry.to_string_lossy();
+            if path_str.contains("/.git/") || path_str.contains("/target/") {
+                continue;
+            }
+            files.push(entry);
+        }
+    }
+    files
+}
+
+fn walkdir_collect(root: &PathBuf) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    walk(root, &mut result);
+    result
 }
 
 async fn cmd_chat(
