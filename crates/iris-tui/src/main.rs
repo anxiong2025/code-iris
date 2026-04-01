@@ -32,6 +32,7 @@ use app::{AgentEvent, AgentState, App, AppMode, ChatRole};
 use iris_core::agent::Agent;
 use iris_core::config::user_env_path;
 use iris_core::context::compress;
+use iris_core::coordinator::{Coordinator, PipelineStep};
 use iris_core::memory as iris_memory;
 use iris_core::permissions::PermissionMode;
 use iris_core::storage::Storage;
@@ -50,6 +51,8 @@ enum WorkerCmd {
     SetCwd(std::path::PathBuf),
     /// /cd — reset to process cwd.
     ResetCwd,
+    /// /plan <prompt> — run three-step pipeline and stream step results.
+    Plan(String),
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -176,6 +179,74 @@ async fn agent_worker(
                     }
                 }
             }
+
+            WorkerCmd::Plan(prompt) => {
+                let steps = vec![
+                    PipelineStep {
+                        label: "product".to_string(),
+                        agent_type: Some("explorer".to_string()),
+                        system_prompt: String::new(),
+                        prompt: format!(
+                            "Analyse this requirement and output a structured breakdown:\n\
+                             - Problem statement\n- Target users\n- Acceptance criteria\n- Constraints\n\n\
+                             Requirement: {prompt}"
+                        ),
+                    },
+                    PipelineStep {
+                        label: "architecture".to_string(),
+                        agent_type: Some("reviewer".to_string()),
+                        system_prompt: String::new(),
+                        prompt: "Based on the product analysis above, produce a technical architecture plan:\n\
+                                 - Component breakdown\n- Interface design\n- Dependencies\n- Risks"
+                            .to_string(),
+                    },
+                    PipelineStep {
+                        label: "implementation".to_string(),
+                        agent_type: Some("worker".to_string()),
+                        system_prompt: String::new(),
+                        prompt: "Based on the analysis and architecture above, generate the implementation:\n\
+                                 - Write the code for each component\n- Include file paths\n- Add tests\n- Note follow-ups"
+                            .to_string(),
+                    },
+                ];
+                let total = steps.len();
+
+                let coord = Coordinator::from_env();
+
+                for (i, step) in steps.iter().enumerate() {
+                    let _ = tx_events.send(AgentEvent::PipelineStep {
+                        index: i,
+                        total,
+                        label: step.label.clone(),
+                        done: false,
+                        text: None,
+                    });
+                }
+
+                match coord.pipeline_run(steps).await {
+                    Ok(results) => {
+                        let mut total_in = 0u32;
+                        let mut total_out = 0u32;
+                        for (i, result) in results.iter().enumerate() {
+                            total_in += result.usage.input_tokens;
+                            total_out += result.usage.output_tokens;
+                            let _ = tx_events.send(AgentEvent::PipelineStep {
+                                index: i,
+                                total,
+                                label: result.label.clone(),
+                                done: true,
+                                text: Some(result.text.clone()),
+                            });
+                        }
+                        let _ = tx_events.send(AgentEvent::System(
+                            format!("Plan complete. tokens in={total_in} out={total_out}")
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx_events.send(AgentEvent::Error(format!("Pipeline error: {e}")));
+                    }
+                }
+            }
         }
     }
 }
@@ -233,6 +304,36 @@ async fn run_event_loop(
                         app.push_system(format!("Error: {err}"));
                         app.agent_state = AgentState::Idle;
                     }
+                    AgentEvent::PipelineStep { index, total, label, done, text } => {
+                        let icon = if done { "✓" } else { "◌" };
+                        let step_label = match label.as_str() {
+                            "product" => "📋 Product",
+                            "architecture" => "🏗 Architecture",
+                            "implementation" => "⚙ Implementation",
+                            other => other,
+                        };
+                        if !done {
+                            app.push_system(format!(
+                                "[{}/{}] {} {} — running…",
+                                index + 1, total, icon, step_label
+                            ));
+                            app.agent_state = AgentState::Thinking;
+                        } else {
+                            app.push_system(format!(
+                                "[{}/{}] {} {} — done",
+                                index + 1, total, icon, step_label
+                            ));
+                            if let Some(t) = text {
+                                app.chat_history.push(crate::app::ChatEntry {
+                                    role: crate::app::ChatRole::Assistant,
+                                    content: t,
+                                });
+                            }
+                            if index + 1 == total {
+                                app.agent_state = AgentState::Idle;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -250,6 +351,7 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                      /model [name]  /compact  /commit [msg]  /memory [note]\n  \
                      /cd <path>  /pwd  /worktree <branch>\n  \
                      /agents                list available agent types\n  \
+                     /plan <prompt>         run 3-step product→arch→impl pipeline\n  \
                      exit|quit"
                 );
             }
@@ -413,6 +515,18 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                 lines.push(String::new());
                 lines.push("Use in CLI: iris run --pipeline --sub \"step@explorer:prompt\"".to_string());
                 app.push_system(lines.join("\n"));
+            }
+
+            _ if cmd.starts_with("/plan ") => {
+                let prompt = cmd.trim_start_matches("/plan ").trim().to_string();
+                if prompt.is_empty() {
+                    app.push_system("Usage: /plan <requirement>");
+                } else {
+                    app.push_user(format!("/plan {prompt}"));
+                    if tx_input.send(WorkerCmd::Plan(prompt)).await.is_err() {
+                        app.push_system("Agent worker stopped unexpectedly.");
+                    }
+                }
             }
 
             _ if cmd.starts_with("/resume ") => {

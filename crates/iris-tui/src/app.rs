@@ -22,6 +22,15 @@ pub enum AgentEvent {
     System(String),
     /// The agent encountered an error.
     Error(String),
+    /// A pipeline step started or completed.
+    PipelineStep {
+        index: usize,
+        total: usize,
+        label: String,
+        /// false = started, true = completed
+        done: bool,
+        text: Option<String>,
+    },
 }
 
 // ── Chat history ──────────────────────────────────────────────────────────────
