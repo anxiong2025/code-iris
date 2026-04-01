@@ -43,13 +43,29 @@ pub struct ContextConfig {
     pub keep_recent_turns: usize,
 }
 
+/// Fraction of `max_tokens` at which Level-4 autocompact fires proactively.
+/// 0.8 = trigger at 80 % of the context window, matching Claude Code behaviour.
+pub const AUTOCOMPACT_THRESHOLD: f32 = 0.8;
+
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            max_tokens: 180_000,       // safely under claude-sonnet 200k limit
+            max_tokens: 200_000,       // full claude-sonnet context window
             max_tool_result_tokens: 8_000,
             keep_recent_turns: 6,
         }
+    }
+}
+
+impl ContextConfig {
+    /// Token count at which L1–L3 local compression runs (90 % of window).
+    pub fn compress_at(&self) -> usize {
+        (self.max_tokens as f32 * 0.90) as usize
+    }
+
+    /// Token count at which L4 autocompact (LLM summary) fires (80 % of window).
+    pub fn autocompact_at(&self) -> usize {
+        (self.max_tokens as f32 * AUTOCOMPACT_THRESHOLD) as usize
     }
 }
 
@@ -143,9 +159,9 @@ pub fn microcompact(messages: &mut Vec<Message>, keep_recent: usize) {
 
 /// Run the full compression pipeline (levels 1–3) and return whether compression occurred.
 ///
-/// Call this before each LLM request to ensure the message list fits in the context window.
+/// Triggers at `config.compress_at()` (90 % of the context window).
 pub fn compress(messages: &mut Vec<Message>, config: &ContextConfig) -> bool {
-    if count_tokens(messages) <= config.max_tokens {
+    if count_tokens(messages) <= config.compress_at() {
         return false;
     }
 

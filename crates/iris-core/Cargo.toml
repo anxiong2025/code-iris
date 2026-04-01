@@ -49,3 +49,7 @@ reqwest.workspace = true
 
 # Internal
 iris-llm.workspace = true
+
+
+[dev-dependencies]
+tempfile = "3"

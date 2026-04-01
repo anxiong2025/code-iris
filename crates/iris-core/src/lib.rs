@@ -6,6 +6,8 @@
 pub mod agent;
 pub mod agent_def;
 pub mod config;
+pub mod hooks;
+pub mod instructions;
 pub mod memory;
 pub mod context;
 pub mod coordinator;

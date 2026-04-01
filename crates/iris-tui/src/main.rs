@@ -125,6 +125,7 @@ async fn agent_worker(
             }
             WorkerCmd::SetCwd(path) => {
                 *agent.cwd.lock().unwrap() = Some(path.clone());
+                agent.reload_hooks_and_instructions();
                 let _ = tx_events.send(AgentEvent::System(
                     format!("Working directory: {}", path.display())
                 ));

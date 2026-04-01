@@ -26,6 +26,8 @@ use iris_llm::{
 use tokio::task::JoinSet;
 
 use crate::context::{compress, ContextConfig};
+use crate::hooks::{HookDecision, HookRunner};
+use crate::instructions;
 use crate::permissions::{format_preview, PermissionMode};
 use crate::storage::{new_session, Session, Storage};
 use crate::tools::{CwdRef, ToolRegistry};
@@ -65,6 +67,10 @@ pub struct Agent {
     pub cwd: CwdRef,
     /// Set to true to interrupt the current streaming turn.
     pub cancel: Arc<AtomicBool>,
+    /// Hooks loaded from `.iris/hooks.toml` / `~/.code-iris/hooks.toml`.
+    pub hooks: HookRunner,
+    /// Extra instructions prepended to the system prompt (from `.iris/instructions.md`).
+    pub instructions: Option<String>,
 }
 
 impl Agent {
@@ -72,7 +78,7 @@ impl Agent {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         let session = new_session();
         let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
-        Ok(Self {
+        let mut agent = Self {
             provider: LlmProvider::Anthropic(AnthropicProvider::new(api_key)),
             config: ModelConfig::new("claude-sonnet-4-6-20250514"),
             tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
@@ -82,7 +88,11 @@ impl Agent {
             storage: Storage::new()?,
             cwd,
             cancel: Arc::new(AtomicBool::new(false)),
-        })
+            hooks: HookRunner::default(),
+            instructions: None,
+        };
+        agent.reload_hooks_and_instructions();
+        Ok(agent)
     }
 
     /// Create an agent using an OpenAI-compatible provider (Qwen, DeepSeek, etc.).
@@ -90,7 +100,7 @@ impl Agent {
         let default_model = provider.default_model.clone();
         let session = new_session();
         let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
-        Ok(Self {
+        let mut agent = Self {
             provider: LlmProvider::OpenAiCompat(provider),
             config: ModelConfig::new(default_model),
             tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
@@ -100,7 +110,11 @@ impl Agent {
             storage: Storage::new()?,
             cwd,
             cancel: Arc::new(AtomicBool::new(false)),
-        })
+            hooks: HookRunner::default(),
+            instructions: None,
+        };
+        agent.reload_hooks_and_instructions();
+        Ok(agent)
     }
 
     /// Auto-detect provider from environment variables and create an agent.
@@ -124,6 +138,8 @@ impl Agent {
                 storage: Storage::new()?,
                 cwd,
                 cancel: Arc::new(AtomicBool::new(false)),
+                hooks: HookRunner::default(),
+                instructions: None,
             }
         } else if let Some(info) = detect_provider() {
             // 2. Google Gemini
@@ -141,6 +157,8 @@ impl Agent {
                     storage: Storage::new()?,
                     cwd,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    hooks: HookRunner::default(),
+                    instructions: None,
                 }
             // 3. Any other OpenAI-compat provider
             } else if info.name != "anthropic" && !key.is_empty() {
@@ -233,6 +251,25 @@ impl Agent {
         self.tools = tools;
     }
 
+    /// (Re)load hooks and instructions from the current working directory.
+    ///
+    /// Called automatically on construction. Call again after `/cd` if the
+    /// project root changes.
+    pub fn reload_hooks_and_instructions(&mut self) {
+        let root = {
+            let guard = self.cwd.lock().unwrap();
+            guard.clone().or_else(|| std::env::current_dir().ok())
+        };
+        self.hooks = HookRunner::load(root.as_deref());
+        self.instructions = instructions::load(root.as_deref());
+        if !self.hooks.is_empty() {
+            tracing::debug!("hooks loaded from {:?}", root);
+        }
+        if self.instructions.is_some() {
+            tracing::debug!("instructions loaded from {:?}", root);
+        }
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     /// Send a user message, execute any tool calls, and return the full response.
@@ -256,18 +293,34 @@ impl Agent {
         let mut tool_calls: Vec<String> = Vec::new();
         let mut usage = TokenUsage::default();
 
+        // Inject layered instructions into the system prompt for this exchange.
+        let effective_config = if let Some(ref instr) = self.instructions {
+            let merged = match self.config.system_prompt.as_deref() {
+                Some(existing) => format!("{instr}\n\n---\n\n{existing}"),
+                None => instr.clone(),
+            };
+            self.config.clone().with_system(merged)
+        } else {
+            self.config.clone()
+        };
+
         for turn in 0..MAX_TURNS {
             // ── [1] Context compression ──────────────────────────────────────
-            if compress(&mut self.session.messages, &self.context_cfg) {
-                tracing::debug!(turn, "context compressed (levels 1-3)");
-            }
-            // Level 4: autocompact via LLM when levels 1–3 are still over budget.
-            if crate::context::count_tokens(&self.session.messages) > self.context_cfg.max_tokens {
+            // L4 autocompact at 80 % of the context window — proactive, before
+            // the window fills, matching Claude Code's behaviour.
+            let token_count = crate::context::count_tokens(&self.session.messages);
+            if token_count >= self.context_cfg.autocompact_at() {
                 match self.autocompact_with_provider().await {
-                    Ok(true) => tracing::info!(turn, "autocompact: conversation summarised"),
+                    Ok(true) => {
+                        tracing::info!(turn, "autocompact: conversation summarised");
+                        on_text("\n[Context compacted — conversation summarised to save space]\n");
+                    }
                     Ok(false) => {}
                     Err(e) => tracing::warn!(turn, "autocompact failed: {e}"),
                 }
+            } else if compress(&mut self.session.messages, &self.context_cfg) {
+                // L1–L3 local compression at 90 %.
+                tracing::debug!(turn, "context compressed (levels 1-3)");
             }
 
             // ── [2] Stream LLM response ───────────────────────────────────────
@@ -278,7 +331,7 @@ impl Agent {
             {
                 let messages = self.session.messages.clone();
                 let defs = self.tools.all_definitions();
-                let config = self.config.clone();
+                let config = effective_config.clone();
 
                 let mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>> =
                     match &mut self.provider {
@@ -339,30 +392,44 @@ impl Agent {
             // ── [4] No tool calls → done ──────────────────────────────────────
             if tool_uses.is_empty() {
                 self.touch_and_save()?;
+                if !response_text.is_empty() {
+                    self.hooks.run_notification(&response_text);
+                }
                 return Ok(AgentResponse { text: response_text, tool_calls, usage });
             }
 
-            // ── [5] Permission checks (serial — may prompt the user) ──────────
+            // ── [5] Permission checks + PreToolUse hooks ──────────────────────
+            //
+            // Both run serially so the user can be prompted and hooks can block
+            // before any parallel execution begins.
             let mut approved: Vec<(String, String, serde_json::Value)> = Vec::new();
-            let mut denied_ids: Vec<String> = Vec::new();
+            // Tracks ids whose tool_result message has already been pushed.
+            let mut skip_ids: Vec<String> = Vec::new();
 
             for (id, name, input) in &tool_uses {
                 tool_calls.push(name.clone());
+                // Permission gate
                 let preview = format_preview(name, input);
-                if self.permissions.request(name, &preview) {
-                    approved.push((id.clone(), name.clone(), input.clone()));
-                } else {
-                    denied_ids.push(id.clone());
+                if !self.permissions.request(name, &preview) {
+                    self.session.messages.push(Message::tool_result(
+                        id,
+                        format!("Permission denied for tool `{name}`"),
+                        true,
+                    ));
+                    skip_ids.push(id.clone());
+                    continue;
                 }
-            }
-
-            // Append denied results immediately.
-            for (id, name, _) in tool_uses.iter().filter(|(id, _, _)| denied_ids.contains(id)) {
-                self.session.messages.push(Message::tool_result(
-                    id,
-                    format!("Permission denied for tool `{name}`"),
-                    true,
-                ));
+                // PreToolUse hook gate
+                match self.hooks.run_pre_tool(name, input).await {
+                    HookDecision::Allow => {
+                        approved.push((id.clone(), name.clone(), input.clone()));
+                    }
+                    HookDecision::Block(msg) => {
+                        tracing::info!(tool = %name, "blocked by PreToolUse hook");
+                        self.session.messages.push(Message::tool_result(id, msg, true));
+                        skip_ids.push(id.clone());
+                    }
+                }
             }
 
             // ── [6] Parallel tool execution ───────────────────────────────────
@@ -372,18 +439,24 @@ impl Agent {
             // appended to session.messages in the original LLM-response order
             // (required by the Anthropic API).
 
+            let hooks = self.hooks.clone();
             let mut join_set: JoinSet<(String, Result<String>)> = JoinSet::new();
 
             for (id, name, input) in approved {
                 let tool = self.tools.get(&name);
+                let hooks = hooks.clone();
                 join_set.spawn(async move {
                     let result = match tool {
                         Some(t) => {
                             tracing::debug!(tool = %name, "executing");
-                            t.execute(input).await
+                            t.execute(input.clone()).await
                         }
                         None => Err(anyhow::anyhow!("Unknown tool: `{name}`")),
                     };
+                    // PostToolUse hook — fire-and-forget
+                    if let Ok(ref output) = result {
+                        hooks.run_post_tool(&name, &input, output);
+                    }
                     (id, result)
                 });
             }
@@ -403,8 +476,8 @@ impl Agent {
 
             // Append tool_result messages in original tool_use order.
             for (id, name, _) in &tool_uses {
-                if denied_ids.contains(id) {
-                    continue; // already appended above
+                if skip_ids.contains(id) {
+                    continue; // already appended above (denied or hook-blocked)
                 }
                 let msg = match results.remove(id) {
                     Some(Ok(output)) => {
@@ -424,7 +497,7 @@ impl Agent {
                 self.session.messages.push(msg);
             }
 
-            tracing::debug!(turn, approved = tool_uses.len() - denied_ids.len(), "continuing");
+            tracing::debug!(turn, approved = tool_uses.len() - skip_ids.len(), "continuing");
         }
 
         tracing::warn!("reached MAX_TURNS ({MAX_TURNS})");
