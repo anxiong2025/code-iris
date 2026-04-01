@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iris_llm::{
-    AnthropicProvider, ContentBlock, Message, ModelConfig, Role, StreamEvent, TokenUsage,
+    AnthropicProvider, ContentBlock, Message, ModelConfig, OpenAiCompatProvider, Role,
+    StreamEvent, TokenUsage,
 };
 use tokio::task::JoinSet;
 
@@ -41,9 +42,16 @@ pub struct AgentResponse {
     pub usage: TokenUsage,
 }
 
+/// Unified LLM backend — either Anthropic native or OpenAI-compatible.
+pub enum LlmProvider {
+    Anthropic(AnthropicProvider),
+    OpenAiCompat(OpenAiCompatProvider),
+}
+
+
 /// The agent — owns the provider, tool registry, permission policy, and session.
 pub struct Agent {
-    provider: AnthropicProvider,
+    provider: LlmProvider,
     config: ModelConfig,
     tools: ToolRegistry,
     context_cfg: ContextConfig,
@@ -56,7 +64,7 @@ impl Agent {
     /// Create an agent using the Anthropic provider with sensible defaults.
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         Ok(Self {
-            provider: AnthropicProvider::new(api_key),
+            provider: LlmProvider::Anthropic(AnthropicProvider::new(api_key)),
             config: ModelConfig::new("claude-sonnet-4-6-20250514"),
             tools: ToolRegistry::default_registry(),
             context_cfg: ContextConfig::default(),
@@ -64,6 +72,60 @@ impl Agent {
             session: new_session(),
             storage: Storage::new()?,
         })
+    }
+
+    /// Create an agent using an OpenAI-compatible provider (Qwen, DeepSeek, etc.).
+    pub fn new_openai_compat(provider: OpenAiCompatProvider) -> Result<Self> {
+        let default_model = provider.default_model.clone();
+        Ok(Self {
+            provider: LlmProvider::OpenAiCompat(provider),
+            config: ModelConfig::new(default_model),
+            tools: ToolRegistry::default_registry(),
+            context_cfg: ContextConfig::default(),
+            permissions: PermissionMode::Default,
+            session: new_session(),
+            storage: Storage::new()?,
+        })
+    }
+
+    /// Auto-detect provider from environment variables and create an agent.
+    ///
+    /// Priority: OAuth credentials → ANTHROPIC_API_KEY → first set env key among all providers.
+    pub fn from_env() -> Result<Self> {
+        use iris_llm::{detect_provider, AuthSource, PROVIDERS};
+
+        // 1. OAuth / Anthropic API key
+        if let Some(auth) = AuthSource::from_env() {
+            return Ok(Self {
+                provider: LlmProvider::Anthropic(AnthropicProvider::with_auth_pub(auth)),
+                config: ModelConfig::new("claude-sonnet-4-6-20250514"),
+                tools: ToolRegistry::default_registry(),
+                context_cfg: ContextConfig::default(),
+                permissions: PermissionMode::Default,
+                session: new_session(),
+                storage: Storage::new()?,
+            });
+        }
+
+        // 2. Any other configured provider
+        if let Some(info) = detect_provider() {
+            let key = std::env::var(info.env_key).unwrap_or_default();
+            // Skip "anthropic" here (already handled above)
+            if info.name != "anthropic" && !key.is_empty() {
+                let compat = OpenAiCompatProvider::new(
+                    info.name,
+                    key,
+                    info.base_url,
+                    info.default_model,
+                );
+                return Self::new_openai_compat(compat);
+            }
+        }
+
+        anyhow::bail!(
+            "No API key found. Set one of: {}\nor run `iris configure`.",
+            PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
+        )
     }
 
     // ── Builder methods ───────────────────────────────────────────────────────
@@ -127,10 +189,12 @@ impl Agent {
             }
             // Level 4: autocompact via LLM when levels 1–3 are still over budget.
             if crate::context::count_tokens(&self.session.messages) > self.context_cfg.max_tokens {
-                match autocompact(&mut self.session.messages, &mut self.provider, &self.context_cfg).await {
-                    Ok(true) => tracing::info!(turn, "autocompact: conversation summarised"),
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!(turn, "autocompact failed: {e}"),
+                if let LlmProvider::Anthropic(ref mut p) = self.provider {
+                    match autocompact(&mut self.session.messages, p, &self.context_cfg).await {
+                        Ok(true) => tracing::info!(turn, "autocompact: conversation summarised"),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(turn, "autocompact failed: {e}"),
+                    }
                 }
             }
 
@@ -144,12 +208,19 @@ impl Agent {
                 let defs = self.tools.all_definitions();
                 let config = self.config.clone();
 
-                let stream = self
-                    .provider
-                    .chat_stream(&messages, &defs, &config)
-                    .await
-                    .context("LLM stream failed")?;
-                futures::pin_mut!(stream);
+                let mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<StreamEvent>> + Send>> =
+                    match &mut self.provider {
+                        LlmProvider::Anthropic(p) => Box::pin(
+                            p.chat_stream(&messages, &defs, &config)
+                                .await
+                                .context("LLM stream failed")?,
+                        ),
+                        LlmProvider::OpenAiCompat(p) => Box::pin(
+                            p.chat_stream(&messages, &defs, &config)
+                                .await
+                                .context("LLM stream failed")?,
+                        ),
+                    };
 
                 while let Some(event) = stream.next().await {
                     match event? {

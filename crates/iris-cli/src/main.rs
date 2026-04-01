@@ -186,10 +186,8 @@ async fn cmd_chat(
     auto: bool,
     plan: bool,
 ) -> Result<()> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .context("ANTHROPIC_API_KEY not set. Run `iris configure` or export the variable.")?;
-
-    let mut agent = Agent::new(api_key)?;
+    let mut agent = Agent::from_env()
+        .context("No API key found. Set ANTHROPIC_API_KEY / DASHSCOPE_API_KEY / DEEPSEEK_API_KEY etc., or run `iris configure`.")?;
 
     if let Some(m) = model {
         agent = agent.with_model(m);

@@ -56,6 +56,11 @@ impl AnthropicProvider {
         AuthSource::from_env().map(Self::with_auth)
     }
 
+    /// Public constructor for use outside the crate (e.g. `Agent::from_env`).
+    pub fn with_auth_pub(auth: AuthSource) -> Self {
+        Self::with_auth(auth)
+    }
+
     fn with_auth(auth: AuthSource) -> Self {
         let client = reqwest::Client::builder()
             .use_rustls_tls()
