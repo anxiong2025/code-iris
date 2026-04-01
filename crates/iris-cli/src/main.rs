@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use iris_core::agent::Agent;
 use iris_core::config::{configure_interactive, load_config, user_env_path};
-use iris_core::coordinator::{Coordinator, SubTask};
+use iris_core::coordinator::{Coordinator, PipelineStep, SubTask};
 use iris_core::memory as iris_memory;
 use iris_core::context::{compress, ContextConfig};
 use iris_core::permissions::PermissionMode;
@@ -90,6 +90,11 @@ enum Command {
         /// Override the model used for all sub-agents and synthesis.
         #[arg(short, long)]
         model: Option<String>,
+        /// Run as serial pipeline instead of parallel fan-out.
+        /// Each step receives all previous outputs as context.
+        /// Steps defined via --sub; agent type prefix: "label@type:prompt"
+        #[arg(long)]
+        pipeline: bool,
     },
 
     /// Start an interactive AI agent session (streaming).
@@ -137,7 +142,7 @@ async fn main() -> Result<()> {
         Command::Login => cmd_login().await?,
         Command::Logout => cmd_logout()?,
         Command::Models => cmd_models(),
-        Command::Run { prompt, subs, model } => cmd_run(prompt, subs, model).await?,
+        Command::Run { prompt, subs, model, pipeline } => cmd_run(prompt, subs, model, pipeline).await?,
         Command::Chat { model, resume, auto, plan } => {
             cmd_chat(model, resume, auto, plan).await?
         }
@@ -211,18 +216,75 @@ async fn cmd_run(
     prompt: String,
     subs: Vec<String>,
     model: Option<String>,
+    pipeline: bool,
 ) -> Result<()> {
     let mut coord = Coordinator::from_env();
     if let Some(m) = model {
         coord = coord.with_model(m);
     }
 
+    // ── Pipeline mode ─────────────────────────────────────────────────────────
+    if pipeline {
+        if subs.is_empty() {
+            eprintln!("--pipeline requires at least one --sub step.");
+            eprintln!("Format: --sub \"label@agent_type:prompt\"  or  --sub \"label:prompt\"");
+            return Ok(());
+        }
+
+        // Parse "label@agent_type:prompt" or "label:prompt".
+        let steps: Vec<PipelineStep> = subs.iter().map(|s| {
+            // Split on first ':' to get label_part and prompt.
+            if let Some((label_part, step_prompt)) = s.split_once(':') {
+                // Check for '@' in label_part to extract agent type.
+                if let Some((label, agent_type)) = label_part.split_once('@') {
+                    PipelineStep::new(label.trim(), agent_type.trim(), step_prompt.trim())
+                } else {
+                    PipelineStep {
+                        label: label_part.trim().to_string(),
+                        agent_type: None,
+                        system_prompt: String::new(),
+                        prompt: step_prompt.trim().to_string(),
+                    }
+                }
+            } else {
+                PipelineStep {
+                    label: s.clone(),
+                    agent_type: None,
+                    system_prompt: String::new(),
+                    prompt: s.clone(),
+                }
+            }
+        }).collect();
+
+        eprintln!("Running {} pipeline steps in sequence…", steps.len());
+        for (i, step) in steps.iter().enumerate() {
+            let type_label = step.agent_type.as_deref().unwrap_or("default");
+            eprintln!("  [{}] {} ({})", i + 1, step.label, type_label);
+        }
+        eprintln!();
+
+        let results = coord.pipeline_run(steps).await?;
+
+        let mut total_in = 0u32;
+        let mut total_out = 0u32;
+        for result in &results {
+            println!("\x1b[1m── {} ──\x1b[0m", result.label);
+            println!("{}", result.text);
+            println!();
+            total_in += result.usage.input_tokens;
+            total_out += result.usage.output_tokens;
+        }
+        eprintln!("\x1b[90m[total tokens in={total_in} out={total_out}]\x1b[0m");
+        return Ok(());
+    }
+
+    // ── Single-agent one-shot mode ────────────────────────────────────────────
     if subs.is_empty() {
-        // Single-agent one-shot mode.
         let tasks = vec![SubTask {
             label: "main".to_string(),
             system_prompt: String::new(),
             prompt: prompt.clone(),
+            agent_type: None,
         }];
         eprintln!("Running single agent task…");
         let results = coord.run(tasks).await?;
@@ -234,22 +296,29 @@ async fn cmd_run(
         return Ok(());
     }
 
-    // Multi-agent mode: parse "label:prompt" pairs.
+    // ── Parallel multi-agent mode ─────────────────────────────────────────────
+    // Parse "label@agent_type:prompt" or "label:prompt".
     let tasks: Vec<SubTask> = subs
         .iter()
         .map(|s| {
-            if let Some((label, sub_prompt)) = s.split_once(':') {
-                SubTask {
-                    label: label.trim().to_string(),
-                    system_prompt: String::new(),
-                    prompt: sub_prompt.trim().to_string(),
+            if let Some((label_part, sub_prompt)) = s.split_once(':') {
+                if let Some((label, agent_type)) = label_part.split_once('@') {
+                    SubTask {
+                        label: label.trim().to_string(),
+                        system_prompt: String::new(),
+                        prompt: sub_prompt.trim().to_string(),
+                        agent_type: Some(agent_type.trim().to_string()),
+                    }
+                } else {
+                    SubTask {
+                        label: label_part.trim().to_string(),
+                        system_prompt: String::new(),
+                        prompt: sub_prompt.trim().to_string(),
+                        agent_type: None,
+                    }
                 }
             } else {
-                SubTask {
-                    label: s.clone(),
-                    system_prompt: String::new(),
-                    prompt: s.clone(),
-                }
+                SubTask::plain(s, s)
             }
         })
         .collect();

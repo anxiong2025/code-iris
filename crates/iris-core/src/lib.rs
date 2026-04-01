@@ -4,6 +4,7 @@
 //! the TUI (`iris-tui`), or any future frontend.
 
 pub mod agent;
+pub mod agent_def;
 pub mod config;
 pub mod memory;
 pub mod context;
