@@ -127,7 +127,7 @@ impl Agent {
             }
             // Level 4: autocompact via LLM when levels 1–3 are still over budget.
             if crate::context::count_tokens(&self.session.messages) > self.context_cfg.max_tokens {
-                match autocompact(&mut self.session.messages, &self.provider, &self.context_cfg).await {
+                match autocompact(&mut self.session.messages, &mut self.provider, &self.context_cfg).await {
                     Ok(true) => tracing::info!(turn, "autocompact: conversation summarised"),
                     Ok(false) => {}
                     Err(e) => tracing::warn!(turn, "autocompact failed: {e}"),

@@ -179,7 +179,7 @@ pub fn compress(messages: &mut Vec<Message>, config: &ContextConfig) -> bool {
 /// Returns `true` if compression was performed.
 pub async fn autocompact(
     messages: &mut Vec<Message>,
-    provider: &iris_llm::AnthropicProvider,
+    provider: &mut iris_llm::AnthropicProvider,
     config: &ContextConfig,
 ) -> anyhow::Result<bool> {
     use futures::StreamExt;
