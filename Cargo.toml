@@ -13,7 +13,12 @@ edition = "2024"
 license = "MIT"
 authors = ["anxiong2025"]
 repository = "https://github.com/anxiong2025/code-iris"
-description = "See through your code — Rust-powered architecture analyzer & AI agent"
+homepage = "https://github.com/anxiong2025/code-iris"
+documentation = "https://github.com/anxiong2025/code-iris/tree/main/docs"
+description = "Rust AI coding agent — single binary, 17+ LLM providers, typed multi-agent pipeline"
+keywords = ["ai", "agent", "llm", "coding", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [workspace.dependencies]
 # Async runtime
