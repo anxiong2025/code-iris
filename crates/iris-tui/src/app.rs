@@ -4,6 +4,7 @@
 //! dedicated tokio task and communicates back via an unbounded channel.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use iris_llm::TokenUsage;
 
@@ -95,6 +96,10 @@ pub struct App {
     pub file_count: usize,
     pub has_api_key: bool,
     pub session_id: Option<String>,
+    /// When the current turn started (for elapsed time display).
+    pub turn_started_at: Option<Instant>,
+    /// Last known max_scroll (updated by render_chat so scroll_up works correctly).
+    pub last_max_scroll: usize,
 }
 
 impl App {
@@ -103,9 +108,8 @@ impl App {
         let git_branch = detect_git_branch(&working_dir);
         let project_type = detect_project_type(&working_dir);
         let file_count = count_source_files(&working_dir);
-        let has_api_key = std::env::var("ANTHROPIC_API_KEY")
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
+        let has_api_key = iris_llm::detect_provider().is_some()
+            || iris_llm::load_credentials().is_some();
 
         let mut app = Self {
             mode: AppMode::Welcome,
@@ -127,6 +131,8 @@ impl App {
             file_count,
             has_api_key,
             session_id,
+            turn_started_at: None,
+            last_max_scroll: 0,
         };
         app.cwd_short = app.working_dir_short();
         app
@@ -197,6 +203,75 @@ impl App {
         let end_byte = self.char_to_byte(self.cursor_pos);
         self.input.drain(start_byte..end_byte);
         self.cursor_pos = pos;
+    }
+
+    /// Delete the character after the cursor (Delete key).
+    pub fn delete_forward(&mut self) {
+        let len = self.input.chars().count();
+        if self.cursor_pos >= len {
+            return;
+        }
+        let start_byte = self.char_to_byte(self.cursor_pos);
+        let end_byte = self.char_to_byte(self.cursor_pos + 1);
+        self.input.drain(start_byte..end_byte);
+    }
+
+    /// Kill from cursor to start of line (Ctrl+U).
+    pub fn kill_to_start(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        let byte_pos = self.char_to_byte(self.cursor_pos);
+        self.input.drain(..byte_pos);
+        self.cursor_pos = 0;
+    }
+
+    /// Kill from cursor to end of line (Ctrl+K).
+    pub fn kill_to_end(&mut self) {
+        let byte_pos = self.char_to_byte(self.cursor_pos);
+        self.input.truncate(byte_pos);
+    }
+
+    /// Move cursor one word to the left (Ctrl+Left / Alt+B).
+    pub fn cursor_word_left(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut pos = self.cursor_pos;
+        // Skip spaces
+        while pos > 0 && chars[pos - 1] == ' ' {
+            pos -= 1;
+        }
+        // Skip word chars
+        while pos > 0 && chars[pos - 1] != ' ' {
+            pos -= 1;
+        }
+        self.cursor_pos = pos;
+    }
+
+    /// Move cursor one word to the right (Ctrl+Right / Alt+F).
+    pub fn cursor_word_right(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let len = chars.len();
+        let mut pos = self.cursor_pos;
+        // Skip word chars
+        while pos < len && chars[pos] != ' ' {
+            pos += 1;
+        }
+        // Skip spaces
+        while pos < len && chars[pos] == ' ' {
+            pos += 1;
+        }
+        self.cursor_pos = pos;
+    }
+
+    /// Insert a string at the current cursor position (for paste).
+    pub fn insert_str(&mut self, s: &str) {
+        let byte_pos = self.char_to_byte(self.cursor_pos);
+        self.input.insert_str(byte_pos, s);
+        self.cursor_pos += s.chars().count();
+        self.mode = AppMode::Chat;
     }
 
     /// Clear the entire input and reset cursor.
@@ -276,6 +351,7 @@ impl App {
         self.mode = AppMode::Chat;
         self.agent_state = AgentState::Thinking;
         self.user_scrolled = false;
+        self.turn_started_at = Some(Instant::now());
     }
 
     pub fn append_assistant_chunk(&mut self, chunk: &str) {
@@ -306,19 +382,31 @@ impl App {
     pub fn finish_response(&mut self, usage: &TokenUsage) {
         self.agent_state = AgentState::Idle;
         self.total_tokens += usage.input_tokens + usage.output_tokens;
+        if let Some(started) = self.turn_started_at.take() {
+            let secs = started.elapsed().as_secs();
+            self.push_system(format!("✦ Responded in {secs}s"));
+        }
     }
 
     pub fn scroll_up(&mut self) {
+        // Normalize from sentinel value to actual position first.
+        if self.scroll_offset > self.last_max_scroll {
+            self.scroll_offset = self.last_max_scroll;
+        }
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
         self.user_scrolled = true;
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll_offset = self.scroll_offset.saturating_add(3);
+        self.scroll_offset = self.scroll_offset.saturating_add(3).min(self.last_max_scroll);
+        if self.scroll_offset >= self.last_max_scroll {
+            self.user_scrolled = false;
+        }
     }
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = usize::MAX / 2;
+        self.user_scrolled = false;
     }
 
     pub fn working_dir_short(&self) -> String {

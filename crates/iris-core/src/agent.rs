@@ -20,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iris_llm::{
-    AnthropicProvider, ContentBlock, GoogleProvider, Message, ModelConfig, OpenAiCompatProvider,
-    Role, StreamEvent, TokenUsage,
+    AnthropicProvider, BedrockProvider, ContentBlock, GoogleProvider, Message, ModelConfig,
+    OpenAiCompatProvider, Role, StreamEvent, TokenUsage,
 };
 use tokio::task::JoinSet;
 
@@ -46,11 +46,12 @@ pub struct AgentResponse {
     pub usage: TokenUsage,
 }
 
-/// Unified LLM backend — Anthropic native, OpenAI-compatible, or Google Gemini.
+/// Unified LLM backend — Anthropic native, OpenAI-compatible, Google Gemini, or AWS Bedrock.
 pub enum LlmProvider {
     Anthropic(AnthropicProvider),
     OpenAiCompat(OpenAiCompatProvider),
     Google(GoogleProvider),
+    Bedrock(BedrockProvider),
 }
 
 
@@ -123,6 +124,34 @@ impl Agent {
     /// Also loads MCP servers from ~/.code-iris/config.toml and registers their tools.
     pub fn from_env() -> Result<Self> {
         use iris_llm::{detect_provider, AuthSource, PROVIDERS};
+
+        // 0. AWS Bedrock bearer token (ABSK... static API keys)
+        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+            if !token.is_empty() {
+                let region = std::env::var("AWS_REGION")
+                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                    .unwrap_or_else(|_| "us-west-2".to_string());
+                let model = std::env::var("BEDROCK_MODEL")
+                    .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-5-20251001-v1:0".to_string());
+                tracing::debug!(%region, %model, "Using AWS Bedrock Converse API");
+                let provider = BedrockProvider::new(token, region, model.clone());
+                let session = new_session();
+                let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
+                return Ok(Self {
+                    provider: LlmProvider::Bedrock(provider),
+                    config: ModelConfig::new(&model).with_max_tokens(8192),
+                    tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
+                    context_cfg: ContextConfig::default(),
+                    permissions: PermissionMode::Default,
+                    session,
+                    storage: Storage::new()?,
+                    cwd,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    hooks: HookRunner::default(),
+                    instructions: None,
+                });
+            }
+        }
 
         // 1. OAuth / Anthropic API key
         let mut agent = if let Some(auth) = AuthSource::from_env() {
@@ -226,6 +255,14 @@ impl Agent {
         self
     }
 
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.config.model = model.into();
+    }
+
+    pub fn current_model(&self) -> &str {
+        &self.config.model
+    }
+
     pub fn with_permissions(mut self, mode: PermissionMode) -> Self {
         self.permissions = mode;
         self
@@ -294,14 +331,39 @@ impl Agent {
         let mut usage = TokenUsage::default();
 
         // Inject layered instructions into the system prompt for this exchange.
-        let effective_config = if let Some(ref instr) = self.instructions {
-            let merged = match self.config.system_prompt.as_deref() {
-                Some(existing) => format!("{instr}\n\n---\n\n{existing}"),
-                None => instr.clone(),
+        let cwd_str = {
+            let guard = self.cwd.lock().unwrap();
+            guard.clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+                .display()
+                .to_string()
+        };
+        let date_line = format!(
+            "Today's date is {}.",
+            chrono::Local::now().format("%Y-%m-%d")
+        );
+        let default_system = format!(
+            "You are an AI coding agent. {date_line}\n\
+             Working directory: {cwd_str}\n\n\
+             You have tools: bash, file_read, file_write, file_edit, grep, glob, \
+             lsp, web_fetch, web_search, task_create/update/list/get, agent_tool.\n\n\
+             Rules:\n\
+             - You MUST use tools to answer questions about the project. Never guess or make up information.\n\
+             - After using tools, summarize findings concisely. Do not reproduce raw file contents.\n\
+             - Do not output code blocks containing tool invocations or file contents.\n\
+             - Be concise. Lead with the answer. Skip preamble."
+        );
+        let effective_config = {
+            let base = match self.config.system_prompt.as_deref() {
+                Some(existing) => format!("{default_system}\n\n{existing}"),
+                None => default_system,
+            };
+            let merged = if let Some(ref instr) = self.instructions {
+                format!("{instr}\n\n---\n\n{base}")
+            } else {
+                base
             };
             self.config.clone().with_system(merged)
-        } else {
-            self.config.clone()
         };
 
         for turn in 0..MAX_TURNS {
@@ -346,6 +408,11 @@ impl Agent {
                                 .context("LLM stream failed")?,
                         ),
                         LlmProvider::Google(p) => Box::pin(
+                            p.chat_stream(&messages, &defs, &config)
+                                .await
+                                .context("LLM stream failed")?,
+                        ),
+                        LlmProvider::Bedrock(p) => Box::pin(
                             p.chat_stream(&messages, &defs, &config)
                                 .await
                                 .context("LLM stream failed")?,
@@ -554,6 +621,7 @@ impl Agent {
             LlmProvider::Anthropic(_) => "claude-haiku-4-5-20251001",
             LlmProvider::OpenAiCompat(p) => p.default_model.as_str(),
             LlmProvider::Google(_) => "gemini-2.0-flash",
+            LlmProvider::Bedrock(p) => p.model.as_str(),
         };
         let summary_config = ModelConfig::new(compact_model).with_max_tokens(2048);
 
@@ -566,6 +634,9 @@ impl Agent {
                     p.chat_stream(&summary_messages, &[], &summary_config).await?,
                 ),
                 LlmProvider::Google(p) => Box::pin(
+                    p.chat_stream(&summary_messages, &[], &summary_config).await?,
+                ),
+                LlmProvider::Bedrock(p) => Box::pin(
                     p.chat_stream(&summary_messages, &[], &summary_config).await?,
                 ),
             };

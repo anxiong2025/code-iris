@@ -214,7 +214,7 @@ impl HookRunner {
             let ctx = ctx.clone();
             let msg = message.to_string();
             tokio::spawn(async move {
-                let mut child = Command::new("sh")
+                let child = Command::new("sh")
                     .arg("-c")
                     .arg(&hook.command)
                     .stdin(std::process::Stdio::null())

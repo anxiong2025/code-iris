@@ -131,6 +131,7 @@ pub fn parse_anthropic_sse(response: Response) -> impl Stream<Item = Result<Stre
 ///
 /// Handles: data: {"choices":[{"delta":{"content":...}}]}
 pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamEvent>> {
+    let debug = std::env::var("IRIS_DEBUG_SSE").map(|v| v == "1").unwrap_or(false);
     stream! {
         let mut event_stream = response.bytes_stream().eventsource();
 
@@ -138,10 +139,16 @@ pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamE
             let event = match event {
                 Ok(e) => e,
                 Err(e) => {
+                    tracing::debug!("SSE parse error: {e}");
                     yield Err(anyhow!("SSE stream error: {e}"));
                     return;
                 }
             };
+
+            if debug {
+                eprintln!("[SSE] event={:?} data={}", event.event, event.data);
+            }
+            tracing::debug!(event_type = %event.event, data = %event.data, "SSE event");
 
             let data = &event.data;
             if data.is_empty() || data == "[DONE]" {
@@ -153,7 +160,10 @@ pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamE
 
             let v: Value = match serde_json::from_str(data) {
                 Ok(v) => v,
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::debug!("SSE JSON parse failed: {e}, data={data}");
+                    continue;
+                }
             };
 
             if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {

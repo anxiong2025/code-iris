@@ -1,10 +1,42 @@
 use anyhow::{bail, Result};
+use async_stream::stream;
 use futures::Stream;
+use reqwest::Response;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 
 use crate::sse::parse_openai_sse;
-use crate::types::{Message, ModelConfig, StreamEvent, ToolDefinition};
+use crate::types::{Message, ModelConfig, StreamEvent, TokenUsage, ToolDefinition};
+
+/// Parse a non-streaming OpenAI-format JSON response into a single-item Stream.
+async fn parse_openai_json(response: Response) -> Result<impl Stream<Item = Result<StreamEvent>>> {
+    let text = response.text().await?;
+    tracing::debug!("Non-streaming JSON body: {text}");
+    let v: serde_json::Value = serde_json::from_str(&text)?;
+
+    let content = v
+        .pointer("/choices/0/message/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let usage = v.get("usage").and_then(|u| {
+        Some(TokenUsage {
+            input_tokens: u.get("prompt_tokens")?.as_u64()? as u32,
+            output_tokens: u.get("completion_tokens")?.as_u64()? as u32,
+        })
+    });
+
+    Ok(stream! {
+        if !content.is_empty() {
+            yield Ok(StreamEvent::TextDelta { text: content });
+        }
+        if let Some(u) = usage {
+            yield Ok(StreamEvent::Usage(u));
+        }
+        yield Ok(StreamEvent::MessageStop);
+    })
+}
 
 /// Metadata about a single LLM provider.
 #[derive(Debug, Clone)]
@@ -187,7 +219,7 @@ impl OpenAiCompatProvider {
         messages: &[Message],
         _tools: &[ToolDefinition],
         config: &ModelConfig,
-    ) -> Result<impl Stream<Item = Result<StreamEvent>>> {
+    ) -> Result<Box<dyn Stream<Item = Result<StreamEvent>> + Unpin + Send>> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let mut openai_messages: Vec<serde_json::Value> = Vec::new();
@@ -225,12 +257,31 @@ impl OpenAiCompatProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        tracing::debug!(provider = self.name, %status, %content_type, "LLM response status");
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             bail!("Provider {} error {status}: {body}", self.name);
         }
 
-        Ok(parse_openai_sse(response))
+        // Debug mode: dump raw body instead of streaming (set IRIS_DEBUG_BODY=1)
+        if std::env::var("IRIS_DEBUG_BODY").as_deref() == Ok("1") {
+            let raw = response.text().await.unwrap_or_default();
+            eprintln!("[DEBUG BODY] provider={} content-type={}\n{}", self.name, content_type, raw);
+            bail!("Debug body dump complete — unset IRIS_DEBUG_BODY to resume normal operation");
+        }
+
+        // If content-type is JSON (not event-stream), parse as non-streaming response.
+        if content_type.contains("application/json") && !content_type.contains("event-stream") {
+            return Ok(Box::new(Box::pin(parse_openai_json(response).await?)));
+        }
+
+        Ok(Box::new(Box::pin(parse_openai_sse(response))))
     }
 }

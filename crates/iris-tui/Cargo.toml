@@ -35,6 +35,9 @@ tracing-subscriber.workspace = true
 # Syntax highlighting
 syntect.workspace = true
 
+# Unicode display width
+unicode-width.workspace = true
+
 # Internal
 iris-core.workspace = true
 iris-llm.workspace = true

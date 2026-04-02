@@ -36,6 +36,12 @@ tracing-subscriber.workspace = true
 # Directories
 dirs.workspace = true
 
+# Terminal width for separator lines
+crossterm.workspace = true
+
+# Readline (arrow keys, history, backspace)
+rustyline = "15"
+
 # Internal
 iris-core.workspace = true
 iris-llm.workspace = true

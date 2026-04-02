@@ -12,7 +12,7 @@
 //! iris chat               — interactive AI agent (streaming)
 //! ```
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -610,20 +610,27 @@ async fn cmd_chat(
         agent.session.id, mode_label
     );
 
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+    // Get terminal width for separator lines (fallback 80).
+    let term_width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let sep = format!("\x1b[90m{}\x1b[0m", "─".repeat(term_width));
+
+    // Readline editor: arrow keys, history, backspace, Ctrl+A/E/W.
+    let mut rl = rustyline::DefaultEditor::new()?;
 
     loop {
-        print!("\x1b[32m❯\x1b[0m ");
-        io::stdout().flush()?;
-
-        let Some(line) = lines.next() else { break };
-        let input = line.context("stdin read error")?;
+        let prompt = format!("{sep}\n\x1b[32m❯\x1b[0m ");
+        let input = match rl.readline(&prompt) {
+            Ok(line) => line,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(rustyline::error::ReadlineError::Interrupted) => break,
+            Err(e) => return Err(e.into()),
+        };
         let input = input.trim().to_string();
 
         if input.is_empty() {
             continue;
         }
+        rl.add_history_entry(&input).ok();
 
         if let Some(result) = handle_slash_command(&input, &mut agent) {
             if result == "__quit__" {
@@ -671,6 +678,15 @@ fn handle_slash_command(input: &str, agent: &mut Agent) -> Option<String> {
 
     Some(match cmd {
         "/quit" | "/exit" | "/q" => "__quit__".to_string(),
+
+        "/model" => {
+            if let Some(m) = parts.get(1) {
+                agent.set_model(m.trim());
+                format!("Model switched to: {}", m.trim())
+            } else {
+                format!("Current model: {}", agent.current_model())
+            }
+        }
 
         "/session" => format!("Session: {}", agent.session.id),
 

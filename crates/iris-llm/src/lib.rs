@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod bedrock;
 pub mod google;
 pub mod mcp;
 pub mod oauth;
@@ -8,6 +9,7 @@ pub mod sse;
 pub mod types;
 
 pub use anthropic::{AnthropicProvider, AuthSource};
+pub use bedrock::BedrockProvider;
 pub use google::GoogleProvider;
 pub use mcp::{McpClient, McpServerConfig, McpTransport};
 pub use oauth::{clear_credentials, load_credentials, login, save_credentials, OAuthTokenSet};

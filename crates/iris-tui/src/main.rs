@@ -9,16 +9,15 @@
 
 use std::io;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
 use ratatui::prelude::*;
-use ratatui::layout::Margin;
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 use tokio::sync::mpsc;
 
@@ -91,14 +90,24 @@ async fn main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture,
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run_event_loop(&mut terminal, tx_input, tx_cancel, rx_events, session_id).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
+        LeaveAlternateScreen,
+    )?;
     terminal.show_cursor()?;
 
     if let Err(err) = result {
@@ -280,7 +289,7 @@ async fn run_event_loop(
     let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(200));
 
     loop {
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| render(frame, &mut app))?;
 
         tokio::select! {
             _ = tick_interval.tick() => {
@@ -289,23 +298,45 @@ async fn run_event_loop(
             }
 
             Some(Ok(event)) = key_stream.next() => {
+                // Bracketed paste — insert pasted text as-is.
+                if let Event::Paste(text) = &event {
+                    app.insert_str(text);
+                    continue;
+                }
+                // Mouse scroll wheel → chat scroll.
+                if let Event::Mouse(mouse) = &event {
+                    use crossterm::event::{MouseEventKind};
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(),
+                        MouseEventKind::ScrollDown => app.scroll_down(),
+                        _ => {}
+                    }
+                    continue;
+                }
                 if let Event::Key(key) = event {
+                    // Only process key-press events — on Windows crossterm
+                    // fires both Press and Release, causing duplicate input.
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
                     // Ctrl+D → exit
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('d')
                     {
                         return Ok(());
                     }
-                    // Ctrl+C → interrupt current turn (or exit if idle)
+                    // Ctrl+C → interrupt current turn, or exit if idle
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('c')
                     {
                         if app.agent_state != AgentState::Idle {
                             tx_cancel.try_send(()).ok();
+                            app.clear_input();
+                            continue;
+                        } else {
+                            // idle: exit like Ctrl+D
+                            return Ok(());
                         }
-                        // Clear input on Ctrl+C as well
-                        app.clear_input();
-                        continue;
                     }
                     // Ctrl+W → delete word before cursor
                     if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -328,8 +359,42 @@ async fn run_event_loop(
                         app.cursor_end();
                         continue;
                     }
+                    // Ctrl+U → kill to start of line
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('u')
+                    {
+                        app.kill_to_start();
+                        continue;
+                    }
+                    // Ctrl+K → kill to end of line
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('k')
+                    {
+                        app.kill_to_end();
+                        continue;
+                    }
 
                     match key.code {
+                        KeyCode::Tab if app.input.starts_with('/') => {
+                            let partial = app.input.as_str();
+                            const COMMANDS: &[&str] = &[
+                                "/help", "/clear", "/session", "/sessions",
+                                "/resume", "/model", "/compact", "/commit",
+                                "/memory", "/cd", "/pwd", "/worktree",
+                                "/agents", "/plan",
+                            ];
+                            let matches: Vec<&&str> = COMMANDS
+                                .iter()
+                                .filter(|c| c.starts_with(partial) && **c != partial)
+                                .collect();
+                            if matches.len() == 1 {
+                                app.input = format!("{} ", matches[0]);
+                                app.cursor_pos = app.input.chars().count();
+                            } else if matches.len() > 1 {
+                                let list = matches.iter().map(|c| **c).collect::<Vec<_>>().join("  ");
+                                app.push_system(list);
+                            }
+                        }
                         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             app.insert_newline();
                         }
@@ -344,11 +409,11 @@ async fn run_event_loop(
                         }
                         KeyCode::Char(c) => app.push_char(c),
                         KeyCode::Backspace => app.pop_char(),
+                        KeyCode::Delete => app.delete_forward(),
                         KeyCode::Esc => {
                             app.clear_input();
                         }
                         KeyCode::Up => {
-                            // If input is non-empty OR we're navigating history → history nav
                             if !app.input.is_empty() || app.history_idx.is_some() {
                                 app.history_prev();
                             } else {
@@ -362,18 +427,18 @@ async fn run_event_loop(
                                 app.scroll_down();
                             }
                         }
-                        KeyCode::Left => {
-                            if !app.input.is_empty() {
-                                app.cursor_left();
-                            } else {
-                                // nothing to do when empty
-                            }
+                        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL)
+                            || key.modifiers.contains(KeyModifiers::ALT) => {
+                            app.cursor_word_left();
                         }
-                        KeyCode::Right => {
-                            if !app.input.is_empty() {
-                                app.cursor_right();
-                            }
+                        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL)
+                            || key.modifiers.contains(KeyModifiers::ALT) => {
+                            app.cursor_word_right();
                         }
+                        KeyCode::Left => app.cursor_left(),
+                        KeyCode::Right => app.cursor_right(),
+                        KeyCode::Home => app.cursor_home(),
+                        KeyCode::End => app.cursor_end(),
                         KeyCode::PageUp => { for _ in 0..10 { app.scroll_up(); } }
                         KeyCode::PageDown => { for _ in 0..10 { app.scroll_down(); } }
                         _ => {}
@@ -644,7 +709,7 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
-fn render(frame: &mut Frame, app: &App) {
+fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let input_h = app.input_height();
     let layout = Layout::vertical([
@@ -665,7 +730,7 @@ fn render(frame: &mut Frame, app: &App) {
 /// Spinner frames for the thinking indicator.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
+fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
 
     for entry in &app.chat_history {
@@ -722,7 +787,10 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
                 )));
             }
         }
-        lines.push(Line::from(""));
+        // No blank line after tool calls — they stack compactly.
+        if entry.role != ChatRole::Tool {
+            lines.push(Line::from(""));
+        }
     }
 
     match app.agent_state {
@@ -750,22 +818,10 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
     let total_lines = lines.len();
     let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = total_lines.saturating_sub(visible);
+    app.last_max_scroll = max_scroll;
     let scroll = app.scroll_offset.min(max_scroll);
 
-    let title = app
-        .session_id
-        .as_deref()
-        .map(|id| format!(" iris · {} ", &id[..8.min(id.len())]))
-        .unwrap_or_else(|| " iris ".to_string());
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(255, 140, 60)))
-        .title(title)
-        .title_style(Style::default().fg(Color::Rgb(255, 140, 60)).bold());
-
     let paragraph = Paragraph::new(lines)
-        .block(block)
         .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0));
 
@@ -774,7 +830,6 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &App) {
     if total_lines > visible {
         let mut scroll_state = ScrollbarState::new(max_scroll).position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
-        frame.render_stateful_widget(scrollbar, inner, &mut scroll_state);
+        frame.render_stateful_widget(scrollbar, area, &mut scroll_state);
     }
 }

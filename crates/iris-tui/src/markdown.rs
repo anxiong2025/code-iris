@@ -165,18 +165,6 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
 fn render_code_block(lang: &str, code_lines: &[String]) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    // Header bar: ╭─ rust ──────────
-    let lang_badge = if lang.is_empty() {
-        String::new()
-    } else {
-        format!(" {} ", lang)
-    };
-    out.push(Line::from(vec![
-        Span::styled("  ╭─", Style::default().fg(C_CODE_BORDER)),
-        Span::styled(lang_badge, Style::default().fg(C_CODE_LANG).bold()),
-        Span::styled("─", Style::default().fg(C_CODE_BORDER)),
-    ]));
-
     // Try syntect highlighting.
     let highlighted = try_highlight(lang, code_lines);
 
@@ -187,21 +175,15 @@ fn render_code_block(lang: &str, code_lines: &[String]) -> Vec<Line<'static>> {
             out.push(Line::from(spans));
         }
     } else {
-        // Fallback: plain green.
         for line in code_lines {
             out.push(Line::from(vec![
                 Span::styled("  │ ", Style::default().fg(C_CODE_BORDER)),
-                Span::styled(line.clone(), Style::default().fg(C_CODE_FG).bg(C_CODE_BG)),
+                Span::styled(line.clone(), Style::default().fg(C_CODE_FG)),
             ]));
         }
     }
 
-    // Footer bar.
-    out.push(Line::from(vec![
-        Span::styled("  ╰──────────", Style::default().fg(C_CODE_BORDER)),
-    ]));
     out.push(Line::from(""));
-
     out
 }
 

@@ -73,6 +73,7 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 glob = "0.3"
 rand = "0.8"
+unicode-width = "0.2"
 sha2 = "0.10"
 base64 = { version = "0.22", features = ["alloc"] }
 urlencoding = "2"

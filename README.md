@@ -79,22 +79,26 @@ command = "iris doc-sync --since HEAD~1"
 
 ## 对比
 
-| | Code Iris | Claude Code | gstack | claw-code |
-|---|---|---|---|---|
-| 语言 | **Rust** | TypeScript | Shell | Python |
-| 分发 | **单二进制** | npm 包 | git clone | pip |
-| 启动时间 | **~1ms** | ~300ms | — | — |
-| 内存 | **~15MB** | ~100MB+ | — | — |
-| 串行 Pipeline | **✅** | ❌ | ❌ | ❌ |
-| 文档漂移检测 | **✅** | ❌ | ❌ | ❌ |
-| Hooks 系统 | **✅** | ✅ | ❌ | ❌ |
-| 分层 Instructions | **✅** | ✅ CLAUDE.md | ❌ | ❌ |
-| LSP 集成 | **✅** | ❌ | ❌ | ❌ |
-| 持久 bash session | **✅** | ✅ | ❌ | ❌ |
-| 多 Provider | **17+** | Anthropic only | Anthropic only | 2 |
-| Claude OAuth | **✅** | ✅ | — | — |
-| MCP Client | **✅** | ✅ | — | — |
-| 开源 | **✅** | ❌ | ❌ | ❌ |
+> 数据基于公开文档和源码，如有出入欢迎提 issue。
+
+| | Code Iris | Claude Code | OpenAI Codex CLI |
+|---|---|---|---|
+| 语言 | **Rust** | TypeScript | TypeScript |
+| 分发 | **单二进制** | npm 包 | npm 包 |
+| 启动时间 | **~1ms** | ~300ms | ~300ms |
+| 内存 | **~15MB** | ~100MB+ | ~100MB+ |
+| 后端 | 本地直连 LLM | Anthropic API | **云沙箱**（需联网） |
+| 串行 Pipeline | **✅** | ❌ | ❌ |
+| 文档漂移检测 | **✅** | ❌ | ❌ |
+| Hooks 系统 | **✅** | ✅ settings.json | ❌ |
+| 分层 Instructions | **✅** | ✅ CLAUDE.md | ✅ AGENTS.md |
+| LSP 集成 | **✅** | ❌ | ❌ |
+| 持久 bash session | **✅**（进程内） | 依赖 MCP shell | ✅（云沙箱） |
+| 多 Provider | **17+** | Anthropic only（可走 proxy） | OpenAI only |
+| Claude OAuth | **✅** | ✅ | ❌ |
+| MCP Client | **✅** | ✅ | ❌ |
+| 子 Agent / 并行 | **✅** | ✅ | ✅ |
+| 开源 | **✅** | ❌ | **✅** |
 
 ---
 
