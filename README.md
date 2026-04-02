@@ -5,6 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/iris-cli.svg)](https://crates.io/crates/iris-cli)
 [![CI](https://github.com/anxiong2025/code-iris/actions/workflows/ci.yml/badge.svg)](https://github.com/anxiong2025/code-iris/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Changelog](https://img.shields.io/badge/changelog-更新日志-orange)](./CHANGELOG.md)
 
 ## 30 秒上手
 
