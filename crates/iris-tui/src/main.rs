@@ -381,24 +381,40 @@ async fn run_event_loop(
                             KeyCode::Down => { app.completion.select_next(); continue; }
                             KeyCode::Tab | KeyCode::Enter => {
                                 if let Some(label) = app.completion.selected_label() {
+                                    let is_enter = key.code == KeyCode::Enter;
                                     match app.completion.kind {
                                         app::CompletionKind::Command => {
                                             let needs_arg = matches!(label,
                                                 "/model" | "/commit" | "/cd" | "/resume" |
                                                 "/memory" | "/worktree" | "/plan"
                                             );
-                                            app.input = if needs_arg {
-                                                format!("{} ", label)
+                                            if needs_arg {
+                                                app.input = format!("{} ", label);
+                                                app.cursor_pos = app.input.chars().count();
+                                                app.completion.update(&app.input);
                                             } else {
-                                                label.to_string()
-                                            };
+                                                // No-arg command: fill and execute on Enter.
+                                                app.input = label.to_string();
+                                                app.completion.dismiss();
+                                                if is_enter {
+                                                    let input = app.take_input();
+                                                    handle_user_input(&mut app, input, &tx_input).await;
+                                                } else {
+                                                    app.cursor_pos = app.input.chars().count();
+                                                }
+                                            }
                                         }
                                         app::CompletionKind::Model => {
                                             app.input = format!("/model {}", label);
+                                            app.completion.dismiss();
+                                            if is_enter {
+                                                let input = app.take_input();
+                                                handle_user_input(&mut app, input, &tx_input).await;
+                                            } else {
+                                                app.cursor_pos = app.input.chars().count();
+                                            }
                                         }
                                     }
-                                    app.cursor_pos = app.input.chars().count();
-                                    app.completion.update(&app.input);
                                 }
                                 continue;
                             }
