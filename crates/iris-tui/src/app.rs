@@ -108,8 +108,12 @@ impl App {
         let git_branch = detect_git_branch(&working_dir);
         let project_type = detect_project_type(&working_dir);
         let file_count = count_source_files(&working_dir);
-        let has_api_key = iris_llm::detect_provider().is_some()
+        let detected = iris_llm::detect_provider();
+        let has_api_key = detected.is_some()
             || iris_llm::load_credentials().is_some();
+        let model_name = detected
+            .map(|p| p.default_model.to_string())
+            .unwrap_or_else(|| "no model".to_string());
 
         let mut app = Self {
             mode: AppMode::Welcome,
@@ -123,7 +127,7 @@ impl App {
             history_idx: None,
             tick: 0,
             cwd_short: String::new(),
-            model_name: "claude-sonnet-4.6".to_string(),
+            model_name,
             total_tokens: 0,
             working_dir,
             git_branch,
