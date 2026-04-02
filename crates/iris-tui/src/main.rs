@@ -679,6 +679,20 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
                 app.push_system(lines.join("\n"));
             }
 
+            "/buddy" => {
+                let buddy = app::roll_buddy();
+                app.buddy = Some(buddy);
+                let (r, g, b) = buddy.rarity.color();
+                let rarity_label = buddy.rarity.label();
+                app.push_system(format!(
+                    "\n  {} {} ({})  [{}] {}\n\n  \"{} is now watching your code.\"\n",
+                    buddy.face, buddy.name, buddy.name_cn,
+                    rarity_label, buddy.trait_name,
+                    buddy.name,
+                ));
+                let _ = (r, g, b); // used by statusbar rendering
+            }
+
             _ if cmd.starts_with("/plan ") => {
                 let prompt = cmd.trim_start_matches("/plan ").trim().to_string();
                 if prompt.is_empty() {

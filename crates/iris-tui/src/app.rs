@@ -8,6 +8,101 @@ use std::time::Instant;
 
 use iris_llm::TokenUsage;
 
+// ── Buddy / Pet system ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct Buddy {
+    pub name: &'static str,
+    pub name_cn: &'static str,
+    pub face: &'static str,
+    pub rarity: Rarity,
+    pub trait_name: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rarity {
+    Common,     // 60%
+    Uncommon,   // 25%
+    Rare,       // 10%
+    Epic,       // 4%
+    Legendary,  // 1%
+}
+
+impl Rarity {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Rarity::Common => "普通",
+            Rarity::Uncommon => "少见",
+            Rarity::Rare => "稀有",
+            Rarity::Epic => "史诗",
+            Rarity::Legendary => "传说",
+        }
+    }
+    pub fn color(&self) -> (u8, u8, u8) {
+        match self {
+            Rarity::Common => (180, 180, 180),
+            Rarity::Uncommon => (100, 200, 100),
+            Rarity::Rare => (100, 150, 255),
+            Rarity::Epic => (180, 100, 255),
+            Rarity::Legendary => (255, 200, 60),
+        }
+    }
+}
+
+pub const BUDDIES: &[Buddy] = &[
+    // Common (60%)
+    Buddy { name: "Duck",     name_cn: "鸭子",   face: "(·v·)",   rarity: Rarity::Common, trait_name: "CHAOS" },
+    Buddy { name: "Goose",    name_cn: "鹅",     face: "(>v<)",   rarity: Rarity::Common, trait_name: "SNARK" },
+    Buddy { name: "Blob",     name_cn: "史莱姆", face: "(·u·)",   rarity: Rarity::Common, trait_name: "PATIENCE" },
+    Buddy { name: "Cat",      name_cn: "猫",     face: "(=^·^=)", rarity: Rarity::Common, trait_name: "WISDOM" },
+    Buddy { name: "Rabbit",   name_cn: "兔子",   face: "(\\(\\)", rarity: Rarity::Common, trait_name: "DEBUGGING" },
+    Buddy { name: "Mushroom", name_cn: "蘑菇",   face: "(~_~)",   rarity: Rarity::Common, trait_name: "CHAOS" },
+    Buddy { name: "Chonk",    name_cn: "胖猫",   face: "(•o•)",   rarity: Rarity::Common, trait_name: "PATIENCE" },
+    // Uncommon (25%)
+    Buddy { name: "Penguin",  name_cn: "企鹅",   face: "(o·o)",   rarity: Rarity::Uncommon, trait_name: "DEBUGGING" },
+    Buddy { name: "Turtle",   name_cn: "乌龟",   face: "(·_·)",   rarity: Rarity::Uncommon, trait_name: "WISDOM" },
+    Buddy { name: "Snail",    name_cn: "蜗牛",   face: "(@·@)",   rarity: Rarity::Uncommon, trait_name: "PATIENCE" },
+    Buddy { name: "Owl",      name_cn: "猫头鹰", face: "(o 0 o)", rarity: Rarity::Uncommon, trait_name: "WISDOM" },
+    Buddy { name: "Robot",    name_cn: "机器人", face: "[·_·]",   rarity: Rarity::Uncommon, trait_name: "DEBUGGING" },
+    // Rare (10%)
+    Buddy { name: "Octopus",  name_cn: "章鱼",   face: "(·~·)",   rarity: Rarity::Rare, trait_name: "CHAOS" },
+    Buddy { name: "Ghost",    name_cn: "幽灵",   face: "(·w·)",   rarity: Rarity::Rare, trait_name: "SNARK" },
+    Buddy { name: "Cactus",   name_cn: "仙人掌", face: "(|+|)",   rarity: Rarity::Rare, trait_name: "SNARK" },
+    // Epic (4%)
+    Buddy { name: "Axolotl",  name_cn: "美西螈", face: "(a.a)",   rarity: Rarity::Epic, trait_name: "WISDOM" },
+    Buddy { name: "Dragon",   name_cn: "龙",     face: "(>o<)",   rarity: Rarity::Epic, trait_name: "CHAOS" },
+    // Legendary (1%)
+    Buddy { name: "Capybara", name_cn: "水豚",   face: "(·_·')",  rarity: Rarity::Legendary, trait_name: "PATIENCE" },
+];
+
+/// Roll a buddy based on rarity weights.
+pub fn roll_buddy() -> &'static Buddy {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Simple RNG from timestamp nanos.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+
+    let roll = seed % 100;
+    let target_rarity = if roll < 1 {
+        Rarity::Legendary
+    } else if roll < 5 {
+        Rarity::Epic
+    } else if roll < 15 {
+        Rarity::Rare
+    } else if roll < 40 {
+        Rarity::Uncommon
+    } else {
+        Rarity::Common
+    };
+
+    // Filter buddies by target rarity and pick one.
+    let pool: Vec<&Buddy> = BUDDIES.iter().filter(|b| b.rarity == target_rarity).collect();
+    let idx = (seed as usize / 7) % pool.len();
+    pool[idx]
+}
+
 // ── Events sent from the agent worker to the TUI ─────────────────────────────
 
 /// Events the agent worker sends back to the TUI event loop.
@@ -108,6 +203,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/memory",    description: "View or add memory notes" },
     SlashCommand { name: "/worktree",  description: "Create git worktree and switch" },
     SlashCommand { name: "/agents",    description: "List available agent types" },
+    SlashCommand { name: "/buddy",     description: "Summon your coding buddy" },
 ];
 
 // ── Completion state ─────────────────────────────────────────────────────────
@@ -240,6 +336,9 @@ pub struct App {
 
     /// Slash command completion menu state.
     pub completion: CompletionState,
+
+    /// Active buddy pet (None until /buddy is used).
+    pub buddy: Option<&'static Buddy>,
 }
 
 impl App {
@@ -278,6 +377,7 @@ impl App {
             turn_started_at: None,
             last_max_scroll: 0,
             completion: CompletionState::new(),
+            buddy: None,
         };
         app.cwd_short = app.working_dir_short();
         app

@@ -7,11 +7,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let branch = app.git_branch.as_deref().unwrap_or("no-git");
     let agent_indicator = match app.agent_state {
         AgentState::Idle => "",
-        AgentState::Thinking => " ⟳ thinking",
-        AgentState::Streaming => " ⟳ streaming",
+        AgentState::Thinking => " * thinking",
+        AgentState::Streaming => " * streaming",
     };
 
-    let segments: Vec<Span> = vec![
+    let mut segments: Vec<Span> = vec![
         Span::styled(
             format!(" git:({branch})"),
             Style::default().fg(Color::Rgb(100, 200, 100)),
@@ -21,26 +21,37 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             app.cwd_short.as_str(),
             Style::default().fg(Color::Rgb(180, 180, 180)),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.model_name.as_str(),
             Style::default().fg(Color::Rgb(200, 200, 100)),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}tok", fmt_count(app.total_tokens as usize)),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}files", app.file_count),
             Style::default().fg(Color::Rgb(100, 180, 255)).bold(),
         ),
-        Span::styled(
-            agent_indicator,
-            Style::default().fg(Color::Rgb(255, 200, 80)).italic(),
-        ),
     ];
+
+    // Show buddy if active.
+    if let Some(buddy) = &app.buddy {
+        let (r, g, b) = buddy.rarity.color();
+        segments.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
+        segments.push(Span::styled(
+            format!("{} {}", buddy.face, buddy.name),
+            Style::default().fg(Color::Rgb(r, g, b)),
+        ));
+    }
+
+    segments.push(Span::styled(
+        agent_indicator,
+        Style::default().fg(Color::Rgb(255, 200, 80)).italic(),
+    ));
 
     frame.render_widget(
         Paragraph::new(Line::from(segments))
