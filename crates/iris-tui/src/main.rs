@@ -374,27 +374,40 @@ async fn run_event_loop(
                         continue;
                     }
 
-                    match key.code {
-                        KeyCode::Tab if app.input.starts_with('/') => {
-                            let partial = app.input.as_str();
-                            const COMMANDS: &[&str] = &[
-                                "/help", "/clear", "/session", "/sessions",
-                                "/resume", "/model", "/compact", "/commit",
-                                "/memory", "/cd", "/pwd", "/worktree",
-                                "/agents", "/plan",
-                            ];
-                            let matches: Vec<&&str> = COMMANDS
-                                .iter()
-                                .filter(|c| c.starts_with(partial) && **c != partial)
-                                .collect();
-                            if matches.len() == 1 {
-                                app.input = format!("{} ", matches[0]);
-                                app.cursor_pos = app.input.chars().count();
-                            } else if matches.len() > 1 {
-                                let list = matches.iter().map(|c| **c).collect::<Vec<_>>().join("  ");
-                                app.push_system(list);
+                    // ── Completion menu intercepts ──────────────────────────
+                    if app.completion.visible {
+                        match key.code {
+                            KeyCode::Up => { app.completion.select_prev(); continue; }
+                            KeyCode::Down => { app.completion.select_next(); continue; }
+                            KeyCode::Tab | KeyCode::Enter => {
+                                if let Some(label) = app.completion.selected_label() {
+                                    match app.completion.kind {
+                                        app::CompletionKind::Command => {
+                                            let needs_arg = matches!(label,
+                                                "/model" | "/commit" | "/cd" | "/resume" |
+                                                "/memory" | "/worktree" | "/plan"
+                                            );
+                                            app.input = if needs_arg {
+                                                format!("{} ", label)
+                                            } else {
+                                                label.to_string()
+                                            };
+                                        }
+                                        app::CompletionKind::Model => {
+                                            app.input = format!("/model {}", label);
+                                        }
+                                    }
+                                    app.cursor_pos = app.input.chars().count();
+                                    app.completion.update(&app.input);
+                                }
+                                continue;
                             }
+                            KeyCode::Esc => { app.completion.dismiss(); continue; }
+                            _ => {} // fall through to normal handling
                         }
+                    }
+
+                    match key.code {
                         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             app.insert_newline();
                         }
@@ -407,6 +420,7 @@ async fn run_event_loop(
                                 handle_user_input(&mut app, input, &tx_input).await;
                             }
                         }
+                        KeyCode::Tab => {} // no-op outside completion
                         KeyCode::Char(c) => app.push_char(c),
                         KeyCode::Backspace => app.pop_char(),
                         KeyCode::Delete => app.delete_forward(),
@@ -454,27 +468,28 @@ async fn run_event_loop(
                     AgentEvent::System(msg) => app.push_system(msg),
 
                     AgentEvent::Error(err) => {
-                        app.push_system(format!("Error: {err}"));
+                        // Extract a human-readable message from JSON errors.
+                        let msg = extract_error_message(&err);
+                        app.push_system(format!("Error: {msg}"));
                         app.agent_state = AgentState::Idle;
                     }
                     AgentEvent::PipelineStep { index, total, label, done, text } => {
-                        let icon = if done { "✓" } else { "◌" };
                         let step_label = match label.as_str() {
-                            "product" => "📋 Product",
-                            "architecture" => "🏗 Architecture",
-                            "implementation" => "⚙ Implementation",
+                            "product" => "Product",
+                            "architecture" => "Architecture",
+                            "implementation" => "Implementation",
                             other => other,
                         };
                         if !done {
                             app.push_system(format!(
-                                "[{}/{}] {} {} — running…",
-                                index + 1, total, icon, step_label
+                                "  [{}/{}] * {} ...",
+                                index + 1, total, step_label
                             ));
                             app.agent_state = AgentState::Thinking;
                         } else {
                             app.push_system(format!(
-                                "[{}/{}] {} {} — done",
-                                index + 1, total, icon, step_label
+                                "  [{}/{}] + {} done",
+                                index + 1, total, step_label
                             ));
                             if let Some(t) = text {
                                 app.chat_history.push(crate::app::ChatEntry {
@@ -725,6 +740,59 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
     input::render(frame, layout[1], app);
     statusbar::render(frame, layout[2], app);
+
+    // ── Completion popup (rendered last as overlay) ───────────────────────
+    if app.completion.visible && !app.completion.items.is_empty() {
+        render_completion(frame, layout[1], app);
+    }
+}
+
+/// Render completion menu above the input box.
+fn render_completion(frame: &mut Frame, input_area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders, Clear};
+
+    let item_count = app.completion.items.len().min(10) as u16;
+    let menu_h = item_count + 2; // +2 for borders
+
+    // Position above the input area.
+    let menu_y = input_area.y.saturating_sub(menu_h);
+    let menu_w = 60u16.min(input_area.width);
+    let menu_area = Rect::new(input_area.x + 2, menu_y, menu_w, menu_h);
+
+    // Clear the area behind the popup.
+    frame.render_widget(Clear, menu_area);
+
+    let lines: Vec<Line> = app.completion.items.iter().enumerate().map(|(i, (label, desc))| {
+        let is_selected = i == app.completion.selected;
+        let (name_style, desc_style) = if is_selected {
+            (
+                Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 100)).bold(),
+                Style::default().fg(Color::Rgb(180, 180, 180)).bg(Color::Rgb(60, 60, 100)),
+            )
+        } else {
+            (
+                Style::default().fg(Color::Rgb(100, 200, 100)),
+                Style::default().fg(Color::Rgb(120, 120, 120)),
+            )
+        };
+        let padded_name = format!("  {:<28}", label);
+        if desc.is_empty() {
+            Line::from(Span::styled(padded_name, name_style))
+        } else {
+            Line::from(vec![
+                Span::styled(padded_name, name_style),
+                Span::styled(*desc, desc_style),
+            ])
+        }
+    }).collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)))
+        .style(Style::default().bg(Color::Rgb(25, 25, 40)));
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, menu_area);
 }
 
 /// Spinner frames for the thinking indicator.
@@ -832,4 +900,28 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, area, &mut scroll_state);
     }
+}
+
+/// Extract a human-readable message from API error strings.
+///
+/// Many providers return JSON with `"message":"..."`.  This pulls out
+/// just the message text without requiring serde_json.
+fn extract_error_message(raw: &str) -> String {
+    // Look for "message":"<text>" pattern in JSON error responses.
+    if let Some(start) = raw.find("\"message\":\"") {
+        let after = &raw[start + 11..]; // skip `"message":"`
+        if let Some(end) = after.find('"') {
+            let msg = &after[..end];
+            if !msg.is_empty() {
+                return msg.to_string();
+            }
+        }
+    }
+    // Fallback: use the last meaningful line.
+    raw.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(raw)
+        .trim()
+        .to_string()
 }

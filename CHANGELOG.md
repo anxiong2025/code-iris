@@ -9,16 +9,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Fixed
 - **TUI: Windows duplicate input** — filter `KeyEventKind::Release` events from crossterm, fixing double characters on Windows (especially CJK input)
 - **TUI: CJK wide-char cursor alignment** — use `unicode-width` for correct cursor rendering over 2-cell-wide characters
+- **Status bar hardcoded model** — now shows actual detected provider model instead of always `claude-sonnet-4.6`
+- **Bedrock provider priority** — moved Bedrock to last-resort fallback, no longer overrides other configured providers
+- **Coordinator hardcoded model** — `pipeline_run` now uses detected provider model
+- **Error messages** — extract human-readable message from JSON API errors instead of showing raw response
+- **Pipeline step icons** — removed broken emoji, use clean ASCII markers
 
 ### Added
 - **TUI: `/` command Tab completion** — type `/` then Tab to autocomplete; multiple matches show candidate list
+- **TUI: Slash command completion menu** — type `/` to see popup with all commands and descriptions, navigate with Up/Down, confirm with Tab/Enter
+- **TUI: `/model` model completion** — type `/model ` to see known model names, auto-complete to avoid typos
 - **TUI: Delete key** — forward-delete at cursor
 - **TUI: Ctrl+U / Ctrl+K** — kill to start / end of line (readline-compatible)
 - **TUI: Ctrl+Left/Right, Alt+Left/Right** — word-wise cursor movement
 - **TUI: Home / End keys** — jump to start / end of input
 - **TUI: Bracketed paste** — paste multi-line text without triggering keybindings
 - **TUI: Mouse scroll wheel** — scroll chat history with mouse
-- **TUI: `insert_str` method** — efficient bulk text insertion for paste support
 
 ## [0.1.0] — 2026-03-28
 

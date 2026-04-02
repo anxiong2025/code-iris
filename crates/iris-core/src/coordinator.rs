@@ -147,9 +147,13 @@ impl Coordinator {
 
     /// Create a coordinator that auto-detects the provider from environment variables.
     pub fn from_env() -> Self {
+        // Use the same model as the detected provider, not hardcoded claude.
+        let model = iris_llm::detect_provider()
+            .map(|p| p.default_model.to_string())
+            .unwrap_or_else(|| "claude-sonnet-4-6-20250514".to_string());
         Self {
             auth: CoordAuth::FromEnv,
-            model: "claude-sonnet-4-6-20250514".to_string(),
+            model,
             bus: MessageBus::new(),
             config: CoordinatorConfig::default(),
             depth: 0,

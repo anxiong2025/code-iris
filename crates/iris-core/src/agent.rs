@@ -123,35 +123,7 @@ impl Agent {
     /// Priority: OAuth credentials → ANTHROPIC_API_KEY → first set env key among all providers.
     /// Also loads MCP servers from ~/.code-iris/config.toml and registers their tools.
     pub fn from_env() -> Result<Self> {
-        use iris_llm::{detect_provider, AuthSource, PROVIDERS};
-
-        // 0. AWS Bedrock bearer token (ABSK... static API keys)
-        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-            if !token.is_empty() {
-                let region = std::env::var("AWS_REGION")
-                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-                    .unwrap_or_else(|_| "us-west-2".to_string());
-                let model = std::env::var("BEDROCK_MODEL")
-                    .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-5-20251001-v1:0".to_string());
-                tracing::debug!(%region, %model, "Using AWS Bedrock Converse API");
-                let provider = BedrockProvider::new(token, region, model.clone());
-                let session = new_session();
-                let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
-                return Ok(Self {
-                    provider: LlmProvider::Bedrock(provider),
-                    config: ModelConfig::new(&model).with_max_tokens(8192),
-                    tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
-                    context_cfg: ContextConfig::default(),
-                    permissions: PermissionMode::Default,
-                    session,
-                    storage: Storage::new()?,
-                    cwd,
-                    cancel: Arc::new(AtomicBool::new(false)),
-                    hooks: HookRunner::default(),
-                    instructions: None,
-                });
-            }
-        }
+        use iris_llm::{detect_provider, AuthSource};
 
         // 1. OAuth / Anthropic API key
         let mut agent = if let Some(auth) = AuthSource::from_env() {
@@ -196,21 +168,52 @@ impl Agent {
                 );
                 Self::new_openai_compat(compat)?
             } else {
-                anyhow::bail!(
-                    "No API key found. Set one of: {}\nor run `iris configure`.",
-                    PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
-                )
+                Self::try_bedrock()?
             }
         } else {
-            anyhow::bail!(
-                "No API key found. Set one of: {}\nor run `iris configure`.",
-                PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
-            )
+            Self::try_bedrock()?
         };
 
         // 3. Load MCP servers from config and register their tools.
         agent.load_mcp_tools();
         Ok(agent)
+    }
+
+    /// Try AWS Bedrock as last-resort provider.
+    fn try_bedrock() -> Result<Self> {
+        use iris_llm::PROVIDERS;
+
+        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+            if !token.is_empty() {
+                let region = std::env::var("AWS_REGION")
+                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                    .unwrap_or_else(|_| "us-west-2".to_string());
+                let model = std::env::var("BEDROCK_MODEL")
+                    .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-5-20251001-v1:0".to_string());
+                tracing::debug!(%region, %model, "Using AWS Bedrock Converse API");
+                let provider = BedrockProvider::new(token, region, model.clone());
+                let session = new_session();
+                let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
+                return Ok(Self {
+                    provider: LlmProvider::Bedrock(provider),
+                    config: ModelConfig::new(&model).with_max_tokens(8192),
+                    tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
+                    context_cfg: ContextConfig::default(),
+                    permissions: PermissionMode::Default,
+                    session,
+                    storage: Storage::new()?,
+                    cwd,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    hooks: HookRunner::default(),
+                    instructions: None,
+                });
+            }
+        }
+
+        anyhow::bail!(
+            "No API key found. Set one of: {}\nor run `iris configure`.",
+            PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
+        )
     }
 
     /// Load MCP server configs from ~/.code-iris/config.toml and register tools.
