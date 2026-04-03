@@ -217,7 +217,7 @@ impl OpenAiCompatProvider {
     pub async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
         config: &ModelConfig,
     ) -> Result<Box<dyn Stream<Item = Result<StreamEvent>> + Unpin + Send>> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -227,26 +227,97 @@ impl OpenAiCompatProvider {
             openai_messages.push(json!({"role": "system", "content": sys}));
         }
         for msg in messages {
-            let role = match msg.role {
-                crate::types::Role::User => "user",
-                crate::types::Role::Assistant => "assistant",
-                crate::types::Role::Tool => "tool",
-            };
-            // Flatten content blocks to a single string for OpenAI compat
-            let content: String = msg.content.iter().filter_map(|b| match b {
-                crate::types::ContentBlock::Text { text } => Some(text.clone()),
-                crate::types::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
-                _ => None,
-            }).collect::<Vec<_>>().join("\n");
-            openai_messages.push(json!({"role": role, "content": content}));
+            match msg.role {
+                crate::types::Role::User => {
+                    // User messages may contain text or tool_results.
+                    // Tool results must be sent as separate "tool" role messages.
+                    for block in &msg.content {
+                        match block {
+                            crate::types::ContentBlock::Text { text } => {
+                                openai_messages.push(json!({"role": "user", "content": text}));
+                            }
+                            crate::types::ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                                let mut m = json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_use_id,
+                                    "content": content,
+                                });
+                                if *is_error == Some(true) {
+                                    // Some providers support error indication
+                                    m["name"] = json!("error");
+                                }
+                                openai_messages.push(m);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                crate::types::Role::Assistant => {
+                    // Assistant messages may contain text + tool_use blocks.
+                    let mut text_parts: Vec<String> = Vec::new();
+                    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+                    for block in &msg.content {
+                        match block {
+                            crate::types::ContentBlock::Text { text } => {
+                                text_parts.push(text.clone());
+                            }
+                            crate::types::ContentBlock::ToolUse { id, name, input } => {
+                                tool_calls.push(json!({
+                                    "id": id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": input.to_string(),
+                                    }
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    let mut m = json!({"role": "assistant"});
+                    let content_str = text_parts.join("\n");
+                    if !content_str.is_empty() {
+                        m["content"] = json!(content_str);
+                    }
+                    if !tool_calls.is_empty() {
+                        m["tool_calls"] = json!(tool_calls);
+                    }
+                    openai_messages.push(m);
+                }
+                crate::types::Role::Tool => {
+                    // Legacy path — shouldn't normally be reached
+                    let content: String = msg.content.iter().filter_map(|b| match b {
+                        crate::types::ContentBlock::Text { text } => Some(text.clone()),
+                        crate::types::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                        _ => None,
+                    }).collect::<Vec<_>>().join("\n");
+                    openai_messages.push(json!({"role": "assistant", "content": content}));
+                }
+            }
         }
 
-        let body = json!({
+        // Convert tool definitions to OpenAI function calling format.
+        let openai_tools: Vec<serde_json::Value> = tools.iter().map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                }
+            })
+        }).collect();
+
+        let mut body = json!({
             "model": config.model,
             "max_tokens": config.max_tokens,
             "messages": openai_messages,
             "stream": true,
         });
+        if !openai_tools.is_empty() {
+            body["tools"] = json!(openai_tools);
+            body["tool_choice"] = json!("auto");
+        }
 
         let response = self
             .client

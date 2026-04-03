@@ -180,38 +180,40 @@ impl Agent {
     }
 
     /// Try AWS Bedrock as last-resort provider.
+    ///
+    /// Checks (in order): `AWS_BEARER_TOKEN_BEDROCK`, then standard IAM
+    /// credentials (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`).
     fn try_bedrock() -> Result<Self> {
         use iris_llm::PROVIDERS;
 
-        if let Ok(token) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-            if !token.is_empty() {
-                let region = std::env::var("AWS_REGION")
-                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-                    .unwrap_or_else(|_| "us-west-2".to_string());
-                let model = std::env::var("BEDROCK_MODEL")
-                    .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-5-20251001-v1:0".to_string());
-                tracing::debug!(%region, %model, "Using AWS Bedrock Converse API");
-                let provider = BedrockProvider::new(token, region, model.clone());
-                let session = new_session();
-                let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
-                return Ok(Self {
-                    provider: LlmProvider::Bedrock(provider),
-                    config: ModelConfig::new(&model).with_max_tokens(8192),
-                    tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
-                    context_cfg: ContextConfig::default(),
-                    permissions: PermissionMode::Default,
-                    session,
-                    storage: Storage::new()?,
-                    cwd,
-                    cancel: Arc::new(AtomicBool::new(false)),
-                    hooks: HookRunner::default(),
-                    instructions: None,
-                });
-            }
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-west-2".to_string());
+        let model = std::env::var("BEDROCK_MODEL")
+            .or_else(|_| std::env::var("ANTHROPIC_DEFAULT_SONNET_MODEL"))
+            .unwrap_or_else(|_| "us.anthropic.claude-sonnet-4-5-20251001-v1:0".to_string());
+
+        if let Some(provider) = BedrockProvider::from_env(region.clone(), model.clone()) {
+            tracing::debug!(%region, %model, "Using AWS Bedrock Converse API");
+            let session = new_session();
+            let cwd: CwdRef = std::sync::Arc::new(std::sync::Mutex::new(None));
+            return Ok(Self {
+                provider: LlmProvider::Bedrock(provider),
+                config: ModelConfig::new(&model).with_max_tokens(8192),
+                tools: ToolRegistry::default_registry_for(Some(&session.id), cwd.clone()),
+                context_cfg: ContextConfig::default(),
+                permissions: PermissionMode::Default,
+                session,
+                storage: Storage::new()?,
+                cwd,
+                cancel: Arc::new(AtomicBool::new(false)),
+                hooks: HookRunner::default(),
+                instructions: None,
+            });
         }
 
         anyhow::bail!(
-            "No API key found. Set one of: {}\nor run `iris configure`.",
+            "No API key found. Set one of: {}, AWS_ACCESS_KEY_ID+AWS_SECRET_ACCESS_KEY\nor run `iris configure`.",
             PROVIDERS.iter().map(|p| p.env_key).collect::<Vec<_>>().join(", ")
         )
     }
@@ -254,12 +256,173 @@ impl Agent {
     // ── Builder methods ───────────────────────────────────────────────────────
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.config.model = model.into();
+        self.config.model = self.normalize_model(model.into());
         self
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
-        self.config.model = model.into();
+        self.config.model = self.normalize_model(model.into());
+    }
+
+    /// Switch model **and** auto-switch provider if the model belongs to a
+    /// different provider than the currently active one.
+    ///
+    /// Returns `(actual_model, switched_provider_name, error_message)`.
+    pub fn switch_model(&mut self, model: impl Into<String>) -> (String, Option<&'static str>, Option<String>) {
+        let model: String = model.into();
+        let targets = Self::infer_provider_candidates(&model);
+        let current = self.provider_name();
+
+        // Same provider family — just update model name.
+        if targets.contains(&current) {
+            self.config.model = self.normalize_model(model);
+            return (self.config.model.clone(), None, None);
+        }
+
+        // Try each candidate provider in order.
+        for &target in &targets {
+            if let Some((new_provider, actual_model)) = self.try_build_provider(target, &model) {
+                self.provider = new_provider;
+                // Re-normalize now that provider may have changed (e.g. Bedrock mapping).
+                self.config.model = self.normalize_model(actual_model);
+                return (self.config.model.clone(), Some(target), None);
+            }
+        }
+
+        // None of the candidates worked — stay on current provider, do NOT change model.
+        let tried = targets.iter().map(|t| *t).collect::<Vec<_>>().join(", ");
+        let err = format!(
+            "Cannot switch to {model}: no credentials for [{tried}]. Model unchanged."
+        );
+        tracing::warn!("{err}");
+        (self.config.model.clone(), None, Some(err))
+    }
+
+    /// Short name of the currently active provider.
+    pub fn provider_name(&self) -> &'static str {
+        match &self.provider {
+            LlmProvider::Anthropic(_) => "anthropic",
+            LlmProvider::OpenAiCompat(p) => {
+                // Leak a &'static str from the heap name — fine, it's a small
+                // set of provider names that live for the process lifetime.
+                // But we can just match common names.
+                match p.name.as_str() {
+                    "deepseek" => "deepseek",
+                    "qwen" => "qwen",
+                    "openai" => "openai",
+                    "groq" => "groq",
+                    "openrouter" => "openrouter",
+                    "moonshot" => "moonshot",
+                    "zhipu" => "zhipu",
+                    "baichuan" => "baichuan",
+                    "minimax" => "minimax",
+                    "yi" => "yi",
+                    "siliconflow" => "siliconflow",
+                    "stepfun" => "stepfun",
+                    "spark" => "spark",
+                    _ => "openai_compat",
+                }
+            }
+            LlmProvider::Google(_) => "google",
+            LlmProvider::Bedrock(_) => "bedrock",
+        }
+    }
+
+    /// Return candidate providers for a model name, in priority order.
+    ///
+    /// Claude models try `anthropic` first, then fall back to `bedrock`.
+    fn infer_provider_candidates(model: &str) -> Vec<&'static str> {
+        let m = model.to_lowercase();
+        if m.contains("claude") || m.contains("anthropic") {
+            if m.contains('.') || m.contains(':') {
+                return vec!["bedrock"];
+            }
+            // Short Claude name: try Anthropic API first, then Bedrock.
+            return vec!["anthropic", "bedrock"];
+        }
+        if m.contains("gpt") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+            return vec!["openai"];
+        }
+        if m.contains("gemini") { return vec!["google"]; }
+        if m.contains("qwen") { return vec!["qwen"]; }
+        if m.contains("deepseek") { return vec!["deepseek"]; }
+        if m.contains("llama") || m.contains("mixtral") { return vec!["groq"]; }
+        if m.contains("moonshot") { return vec!["moonshot"]; }
+        if m.contains("glm") { return vec!["zhipu"]; }
+        if m.contains("baichuan") { return vec!["baichuan"]; }
+        if m.contains("minimax") { return vec!["minimax"]; }
+        if m.starts_with("yi-") { return vec!["yi"]; }
+        if m.starts_with("step-") { return vec!["stepfun"]; }
+        if m.contains("general") || m.contains("spark") { return vec!["spark"]; }
+        vec![]
+    }
+
+    /// Try to build a new LlmProvider for the given target provider + model.
+    /// Returns None if the required API key is missing.
+    fn try_build_provider(&self, target: &str, model: &str) -> Option<(LlmProvider, String)> {
+        use iris_llm::{get_provider, AnthropicProvider, AuthSource};
+
+        match target {
+            "anthropic" => {
+                let auth = AuthSource::from_env()?;
+                let p = AnthropicProvider::with_auth_pub(auth);
+                Some((LlmProvider::Anthropic(p), model.to_string()))
+            }
+            "bedrock" => {
+                let region = std::env::var("AWS_REGION")
+                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                    .unwrap_or_else(|_| "us-west-2".to_string());
+                let bp = BedrockProvider::from_env(region, model.to_string())?;
+                Some((LlmProvider::Bedrock(bp), model.to_string()))
+            }
+            "google" => {
+                let key = std::env::var("GOOGLE_API_KEY").ok().filter(|k| !k.is_empty())?;
+                Some((LlmProvider::Google(iris_llm::GoogleProvider::new(key)), model.to_string()))
+            }
+            _ => {
+                // OpenAI-compat providers
+                let info = get_provider(target)?;
+                let key = std::env::var(info.env_key).ok().filter(|k| !k.is_empty())?;
+                let p = OpenAiCompatProvider::from_info(info, key);
+                Some((LlmProvider::OpenAiCompat(p), model.to_string()))
+            }
+        }
+    }
+
+    /// When the active provider is Bedrock, map short Claude model names
+    /// to their full Bedrock model IDs.
+    ///
+    /// Priority:
+    /// 1. `ANTHROPIC_DEFAULT_OPUS_MODEL` / `SONNET` / `HAIKU` env vars
+    /// 2. `BEDROCK_MODEL` env var (generic override)
+    /// 3. Hardcoded fallback `us.anthropic.<name>-v1:0`
+    fn normalize_model(&self, model: String) -> String {
+        if !matches!(self.provider, LlmProvider::Bedrock(_)) {
+            return model;
+        }
+        // Already a Bedrock-qualified ID (contains a dot) — leave it alone.
+        if model.contains('.') {
+            return model;
+        }
+        let m = model.to_lowercase();
+        // Check env vars first — user knows their exact Bedrock model IDs.
+        let env_mapped = if m.contains("opus") {
+            std::env::var("ANTHROPIC_DEFAULT_OPUS_MODEL").ok()
+        } else if m.contains("sonnet") {
+            std::env::var("ANTHROPIC_DEFAULT_SONNET_MODEL").ok()
+        } else if m.contains("haiku") {
+            std::env::var("ANTHROPIC_DEFAULT_HAIKU_MODEL").ok()
+        } else {
+            None
+        };
+        if let Some(mapped) = env_mapped.filter(|s| !s.is_empty()) {
+            tracing::info!(short = %model, bedrock = %mapped, "mapped model via env var");
+            return mapped;
+        }
+        // Fallback: wrap as us.anthropic.<name>-v1:0
+        let fallback = format!("us.anthropic.{model}-v1:0");
+        tracing::info!(short = %model, bedrock = %fallback, "auto-mapped model name for Bedrock (fallback)");
+        fallback
     }
 
     pub fn current_model(&self) -> &str {
@@ -314,7 +477,7 @@ impl Agent {
 
     /// Send a user message, execute any tool calls, and return the full response.
     pub async fn chat(&mut self, user_input: &str) -> Result<AgentResponse> {
-        self.chat_streaming(user_input, |_| {}).await
+        self.chat_streaming(user_input, |_| {}, |_| {}).await
     }
 
     /// Like [`chat`], but calls `on_text` with each streamed text delta.
@@ -325,6 +488,7 @@ impl Agent {
         &mut self,
         user_input: &str,
         mut on_text: impl FnMut(&str),
+        mut on_tool: impl FnMut(&str),
     ) -> Result<AgentResponse> {
         self.cancel.store(false, Ordering::Relaxed);
         self.session.messages.push(Message::user(user_input));
@@ -403,41 +567,56 @@ impl Agent {
                         LlmProvider::Anthropic(p) => Box::pin(
                             p.chat_stream(&messages, &defs, &config)
                                 .await
-                                .context("LLM stream failed")?,
+                                .map_err(|e| anyhow::anyhow!("LLM stream failed: {e:#}"))?,
                         ),
                         LlmProvider::OpenAiCompat(p) => Box::pin(
                             p.chat_stream(&messages, &defs, &config)
                                 .await
-                                .context("LLM stream failed")?,
+                                .map_err(|e| anyhow::anyhow!("LLM stream failed: {e:#}"))?,
                         ),
                         LlmProvider::Google(p) => Box::pin(
                             p.chat_stream(&messages, &defs, &config)
                                 .await
-                                .context("LLM stream failed")?,
+                                .map_err(|e| anyhow::anyhow!("LLM stream failed: {e:#}"))?,
                         ),
                         LlmProvider::Bedrock(p) => Box::pin(
                             p.chat_stream(&messages, &defs, &config)
                                 .await
-                                .context("LLM stream failed")?,
+                                .map_err(|e| anyhow::anyhow!("LLM stream failed: {e:#}"))?,
                         ),
                     };
 
-                while let Some(event) = stream.next().await {
+                // Read stream events with a per-event timeout.
+                // Some providers keep the SSE connection open indefinitely after
+                // sending all data — the timeout breaks us out of that hang.
+                loop {
                     if self.cancel.load(Ordering::Relaxed) {
                         self.cancel.store(false, Ordering::Relaxed);
                         break;
                     }
-                    match event? {
-                        StreamEvent::TextDelta { text } => {
-                            on_text(&text);
-                            assistant_text.push_str(&text);
+                    let next = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        stream.next(),
+                    ).await;
+                    match next {
+                        Ok(Some(event)) => match event? {
+                            StreamEvent::TextDelta { text } => {
+                                on_text(&text);
+                                assistant_text.push_str(&text);
+                            }
+                            StreamEvent::ThinkingDelta { .. } => {}
+                            StreamEvent::ToolUse { id, name, input } => {
+                                tool_uses.push((id, name, input));
+                            }
+                            StreamEvent::Usage(u) => usage.accumulate(&u),
+                            StreamEvent::MessageStop => break,
+                        },
+                        Ok(None) => break, // stream ended
+                        Err(_) => {
+                            // 30s timeout — likely provider didn't close connection.
+                            tracing::warn!(turn, "stream read timed out after 30s — breaking");
+                            break;
                         }
-                        StreamEvent::ThinkingDelta { .. } => {}
-                        StreamEvent::ToolUse { id, name, input } => {
-                            tool_uses.push((id, name, input));
-                        }
-                        StreamEvent::Usage(u) => usage.accumulate(&u),
-                        StreamEvent::MessageStop => break,
                     }
                 }
             }
@@ -478,6 +657,7 @@ impl Agent {
 
             for (id, name, input) in &tool_uses {
                 tool_calls.push(name.clone());
+                on_tool(name);
                 // Permission gate
                 let preview = format_preview(name, input);
                 if !self.permissions.request(name, &preview) {

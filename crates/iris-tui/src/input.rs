@@ -1,13 +1,40 @@
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::App;
+
+/// Threshold: if pasted content exceeds this many lines, collapse it.
+const COLLAPSE_LINES: usize = 10;
+/// Threshold: if pasted content exceeds this many chars, collapse it.
+const COLLAPSE_CHARS: usize = 500;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
+
+    // Detect long paste — collapse to summary.
+    let input_lines_count = app.input.lines().count();
+    let input_char_count = app.input.chars().count();
+    let is_collapsed = input_lines_count > COLLAPSE_LINES || input_char_count > COLLAPSE_CHARS;
+
+    if is_collapsed {
+        let summary = format!(
+            "({} lines, {} chars pasted)",
+            input_lines_count, input_char_count,
+        );
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("❯ ", Style::default().fg(Color::Rgb(100, 200, 100)).bold()),
+                Span::styled(summary, Style::default().fg(Color::Rgb(180, 180, 180)).italic()),
+                Span::styled("█", Style::default().fg(Color::Rgb(100, 200, 100))),
+            ]),
+        ];
+        let input_widget = Paragraph::new(lines).block(block);
+        frame.render_widget(input_widget, area);
+        return;
+    }
 
     let chars: Vec<char> = app.input.chars().collect();
     let cursor = app.cursor_pos.min(chars.len());
@@ -41,7 +68,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             let next_char = first_after.chars().next();
             if let Some(ch) = next_char {
                 let width = ch.width().unwrap_or(1);
-                // Cursor highlight over the next character.
                 let cursor_str = ch.to_string();
                 spans.push(Span::styled(
                     cursor_str,
@@ -49,15 +75,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                         .fg(Color::Black)
                         .bg(Color::Rgb(100, 200, 100)),
                 ));
-                // Rest of the first after-line.
                 let rest_after: String = first_after.chars().skip(1).collect();
                 if !rest_after.is_empty() {
                     spans.push(Span::styled(rest_after, Style::default().fg(Color::White)));
                 }
-                let _ = width; // width is handled correctly by ratatui's Span rendering
+                let _ = width;
             } else {
-                // Cursor at end — show a block cursor.
-                // Use a full-width block if the previous char was CJK for visual consistency.
                 spans.push(Span::styled(
                     "█",
                     Style::default().fg(Color::Rgb(100, 200, 100)),
@@ -66,7 +89,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
             lines.push(Line::from(spans));
 
-            // Remaining after-lines (multi-line input).
             for al in after_lines.iter().skip(1) {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
@@ -86,6 +108,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let input_widget = Paragraph::new(lines).block(block);
+    let input_widget = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(input_widget, area);
 }

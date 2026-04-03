@@ -516,6 +516,8 @@ async fn cmd_doc_sync(since: String, path: PathBuf, model: Option<String>) -> Re
         .chat_streaming(&prompt, |chunk| {
             print!("{chunk}");
             io::stdout().flush().ok();
+        }, |tool| {
+            eprintln!("\x1b[90m  ⎿ {tool}\x1b[0m");
         })
         .await?;
 
@@ -648,6 +650,8 @@ async fn cmd_chat(
             .chat_streaming(&input, |chunk| {
                 print!("{chunk}");
                 io::stdout().flush().ok();
+            }, |tool| {
+                eprintln!("\x1b[90m  ⎿ {tool}\x1b[0m");
             })
             .await?;
 

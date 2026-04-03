@@ -127,13 +127,22 @@ pub fn parse_anthropic_sse(response: Response) -> impl Stream<Item = Result<Stre
     }
 }
 
+/// Accumulator for streamed OpenAI tool calls (arguments arrive in chunks).
+struct OaiToolAccum {
+    id: String,
+    name: String,
+    args_buf: String,
+}
+
 /// Parse OpenAI-format SSE stream into typed StreamEvents.
 ///
-/// Handles: data: {"choices":[{"delta":{"content":...}}]}
+/// Handles: data: {"choices":[{"delta":{"content":...,"tool_calls":[...]}}]}
 pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamEvent>> {
     let debug = std::env::var("IRIS_DEBUG_SSE").map(|v| v == "1").unwrap_or(false);
     stream! {
         let mut event_stream = response.bytes_stream().eventsource();
+        // Track in-progress tool calls by index.
+        let mut tool_accums: Vec<OaiToolAccum> = Vec::new();
 
         while let Some(event) = futures::StreamExt::next(&mut event_stream).await {
             let event = match event {
@@ -153,6 +162,16 @@ pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamE
             let data = &event.data;
             if data.is_empty() || data == "[DONE]" {
                 if data == "[DONE]" {
+                    // Flush any pending tool calls.
+                    for acc in tool_accums.drain(..) {
+                        let input: Value = if acc.args_buf.is_empty() {
+                            Value::Object(Default::default())
+                        } else {
+                            serde_json::from_str(&acc.args_buf)
+                                .unwrap_or(Value::String(acc.args_buf))
+                        };
+                        yield Ok(StreamEvent::ToolUse { id: acc.id, name: acc.name, input });
+                    }
                     yield Ok(StreamEvent::MessageStop);
                 }
                 continue;
@@ -168,15 +187,72 @@ pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamE
 
             if let Some(choices) = v.get("choices").and_then(|c| c.as_array()) {
                 for choice in choices {
-                    if let Some(delta) = choice.get("delta") {
+                    // Some providers send "message" instead of "delta" in SSE.
+                    let delta = choice.get("delta")
+                        .or_else(|| choice.get("message"));
+
+                    // Process content and tool calls from delta (if present).
+                    if let Some(delta) = delta {
+                        // Text content
                         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                             if !content.is_empty() {
                                 yield Ok(StreamEvent::TextDelta { text: content.to_string() });
                             }
                         }
+
+                        // Tool calls (streamed in chunks)
+                        if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            for tc in tool_calls {
+                                tracing::debug!("tool_call delta chunk: {tc}");
+                                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                                while tool_accums.len() <= idx {
+                                    tool_accums.push(OaiToolAccum {
+                                        id: String::new(),
+                                        name: String::new(),
+                                        args_buf: String::new(),
+                                    });
+                                }
+                                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                                    tool_accums[idx].id = id.to_string();
+                                }
+                                if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
+                                    if !name.is_empty() && tool_accums[idx].name.is_empty() {
+                                        tool_accums[idx].name = name.to_string();
+                                    }
+                                }
+                                if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                                    tool_accums[idx].args_buf.push_str(args);
+                                }
+                            }
+                        }
                     }
-                    // finish_reason == "stop"
-                    if choice.get("finish_reason").and_then(|r| r.as_str()) == Some("stop") {
+
+                    // finish_reason check — MUST be outside the delta block.
+                    // Some providers (e.g. Qwen) send finish_reason in a chunk
+                    // without a delta field, so checking inside delta would miss it.
+                    let finish = choice.get("finish_reason").and_then(|r| r.as_str());
+                    if finish == Some("tool_calls") || finish == Some("function_call") {
+                        for acc in tool_accums.drain(..) {
+                            let input: Value = if acc.args_buf.is_empty() {
+                                Value::Object(Default::default())
+                            } else {
+                                serde_json::from_str(&acc.args_buf)
+                                    .unwrap_or(Value::String(acc.args_buf))
+                            };
+                            yield Ok(StreamEvent::ToolUse { id: acc.id, name: acc.name, input });
+                        }
+                        yield Ok(StreamEvent::MessageStop);
+                    }
+                    if finish == Some("stop") || finish == Some("length") {
+                        for acc in tool_accums.drain(..) {
+                            let input: Value = if acc.args_buf.is_empty() {
+                                Value::Object(Default::default())
+                            } else {
+                                serde_json::from_str(&acc.args_buf)
+                                    .unwrap_or(Value::String(acc.args_buf))
+                            };
+                            yield Ok(StreamEvent::ToolUse { id: acc.id, name: acc.name, input });
+                        }
                         yield Ok(StreamEvent::MessageStop);
                     }
                 }
@@ -191,6 +267,18 @@ pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamE
                 }
             }
         }
+        // SSE stream ended without [DONE] or finish_reason — safety net.
+        // Flush any pending tool calls and ensure MessageStop is always sent.
+        for acc in tool_accums.drain(..) {
+            let input: Value = if acc.args_buf.is_empty() {
+                Value::Object(Default::default())
+            } else {
+                serde_json::from_str(&acc.args_buf)
+                    .unwrap_or(Value::String(acc.args_buf))
+            };
+            yield Ok(StreamEvent::ToolUse { id: acc.id, name: acc.name, input });
+        }
+        yield Ok(StreamEvent::MessageStop);
     }
 }
 

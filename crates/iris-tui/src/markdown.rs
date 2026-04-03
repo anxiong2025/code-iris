@@ -28,15 +28,15 @@ static TS: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 const C_HEADING1: Color = Color::Rgb(255, 200, 80);
 const C_HEADING2: Color = Color::Rgb(230, 180, 60);
 const C_HEADING3: Color = Color::Rgb(200, 160, 50);
-const C_CODE_BG: Color = Color::Rgb(30, 32, 40);
-const C_CODE_FG: Color = Color::Rgb(180, 230, 180);
-const C_CODE_BORDER: Color = Color::Rgb(70, 75, 100);
+const C_CODE_BG: Color = Color::Rgb(35, 35, 45);
+const C_CODE_FG: Color = Color::Rgb(170, 210, 170);
+const C_CODE_BORDER: Color = Color::Rgb(60, 65, 85);
 const C_CODE_LANG: Color = Color::Rgb(130, 140, 200);
 const C_QUOTE: Color = Color::Rgb(150, 150, 180);
 const C_BULLET: Color = Color::Rgb(100, 200, 100);
 const C_BOLD: Color = Color::Rgb(255, 255, 255);
 const C_ITALIC: Color = Color::Rgb(200, 200, 230);
-const C_INLINE_CODE: Color = Color::Rgb(180, 230, 180);
+const C_INLINE_CODE: Color = Color::Rgb(210, 200, 170);
 const C_TEXT: Color = Color::Rgb(220, 220, 220);
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -142,9 +142,14 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
             continue;
         }
 
-        // ── Blank line ────────────────────────────────────────────────────────
+        // ── Blank line (collapse consecutive blanks into one) ────────────────
         if raw_line.trim().is_empty() {
-            lines.push(Line::from(""));
+            let already_blank = lines.last()
+                .map(|l: &Line| l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty()))
+                .unwrap_or(false);
+            if !already_blank {
+                lines.push(Line::from(""));
+            }
             continue;
         }
 
@@ -183,7 +188,6 @@ fn render_code_block(lang: &str, code_lines: &[String]) -> Vec<Line<'static>> {
         }
     }
 
-    out.push(Line::from(""));
     out
 }
 
@@ -257,8 +261,8 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
             }
             let code: String = chars[start..i].iter().collect();
             spans.push(Span::styled(
-                format!(" {code} "),
-                Style::default().fg(C_INLINE_CODE).bg(C_CODE_BG),
+                code,
+                Style::default().fg(C_INLINE_CODE),
             ));
             if i < chars.len() {
                 i += 1;

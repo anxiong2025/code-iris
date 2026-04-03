@@ -11,15 +11,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         AgentState::Streaming => " * streaming",
     };
 
+    // Extract just the project name (last path component).
+    let project_name = app.working_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| app.cwd_short.clone());
+
     let mut segments: Vec<Span> = vec![
         Span::styled(
-            format!(" git:({branch})"),
-            Style::default().fg(Color::Rgb(100, 200, 100)),
+            format!(" {project_name}"),
+            Style::default().fg(Color::Rgb(180, 180, 180)).bold(),
         ),
         Span::styled("  ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            app.cwd_short.as_str(),
-            Style::default().fg(Color::Rgb(180, 180, 180)),
+            format!("git:({branch})"),
+            Style::default().fg(Color::Rgb(100, 200, 100)),
         ),
         Span::styled(" | ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -38,16 +44,6 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ];
 
-    // Show buddy if active.
-    if let Some(buddy) = &app.buddy {
-        let (r, g, b) = buddy.rarity.color();
-        segments.push(Span::styled(" | ", Style::default().fg(Color::DarkGray)));
-        segments.push(Span::styled(
-            format!("{} {}", buddy.face, buddy.name),
-            Style::default().fg(Color::Rgb(r, g, b)),
-        ));
-    }
-
     segments.push(Span::styled(
         agent_indicator,
         Style::default().fg(Color::Rgb(255, 200, 80)).italic(),
@@ -55,7 +51,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(segments))
-            .style(Style::default().bg(Color::Rgb(20, 20, 30))),
+            .style(Style::default()),
         area,
     );
 }

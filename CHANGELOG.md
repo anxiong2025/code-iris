@@ -7,6 +7,11 @@ code-iris 的所有重要变更记录在此文件中。
 ## [未发布]
 
 ### 新增
+- **AWS Bedrock 完整支持** — InvokeModel API (Anthropic Messages 格式)，Bearer token + SigV4 双认证，自动读取 `~/.aws/credentials` 和 `~/.aws/config`
+- **`/model` 自动切换 Provider** — 选择不同 provider 的模型时自动切换后端（如从 qwen 切到 bedrock），支持 fallback 链（anthropic → bedrock）
+- **Bedrock 模型名映射** — 短名 `claude-opus-4-6` 自动映射为 Bedrock ID，优先读取 `ANTHROPIC_DEFAULT_OPUS_MODEL` 等环境变量
+- **Bedrock Tool Calling** — 完整支持 Anthropic 格式的 tool 定义和 tool_use 响应解析
+- **Google Gemini Tool Calling** — 支持 `function_declarations` 格式发送 tool 定义，解析 `functionCall` 响应
 - **`/buddy` 宠物系统** — 18 种 ASCII 宠物，5 档稀有度（普通 60% → 传说 1%），抽到后显示在状态栏
 - **`/` 命令补全菜单** — 输入 `/` 自动弹出命令列表 + 描述，Up/Down 选择，Tab/Enter 确认
 - **`/model` 模型名补全** — 输入 `/model ` 弹出已知模型列表，避免拼写错误
@@ -19,6 +24,9 @@ code-iris 的所有重要变更记录在此文件中。
 - **CJK 宽字符支持** — 引入 `unicode-width`，中文光标对齐正确
 
 ### 修复
+- **Bedrock tool_use ID 清洗** — 跨 provider 切换时，自动清洗不符合 Anthropic ID 格式的 tool ID (`^[a-zA-Z0-9_-]+$`)
+- **LLM 错误信息透传** — 不再只显示 "LLM stream failed"，现在展示完整的 provider 错误详情
+- **`/model` 切换失败不污染状态** — 凭证缺失时模型名保持不变，不会设成无效值
 - **Windows 重复输入** — 过滤 crossterm 的 `KeyEventKind::Release` 事件，修复 Windows 下每个按键产生两个字符
 - **状态栏硬编码 claude** — 现在显示实际检测到的 provider 模型名
 - **Bedrock 优先级** — 移到最低优先级兜底，不再抢占其他已配置的 provider

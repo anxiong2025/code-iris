@@ -22,6 +22,9 @@ use ratatui::widgets::{
 use tokio::sync::mpsc;
 
 mod app;
+mod buddy;
+mod commands;
+mod completion;
 mod input;
 mod markdown;
 mod statusbar;
@@ -32,9 +35,7 @@ use iris_core::agent::Agent;
 use iris_core::config::user_env_path;
 use iris_core::context::compress;
 use iris_core::coordinator::{Coordinator, PipelineStep};
-use iris_core::memory as iris_memory;
 use iris_core::permissions::PermissionMode;
-use iris_core::storage::Storage;
 
 /// Commands sent from the TUI event loop to the agent worker.
 enum WorkerCmd {
@@ -129,8 +130,18 @@ async fn agent_worker(
     while let Some(cmd) = rx_input.recv().await {
         match cmd {
             WorkerCmd::SetModel(model) => {
-                agent = agent.with_model(&model);
-                let _ = tx_events.send(AgentEvent::System(format!("Model switched to: {model}")));
+                let (actual, switched_provider, error) = agent.switch_model(&model);
+                let _ = tx_events.send(AgentEvent::ModelSwitched { actual_model: actual.clone() });
+                if let Some(err) = error {
+                    let _ = tx_events.send(AgentEvent::Error(err));
+                } else {
+                    let msg = match switched_provider {
+                        Some(provider) => format!("Model switched to: {actual} (provider → {provider})"),
+                        None if actual != model => format!("Model switched to: {actual} (mapped from {model})"),
+                        None => format!("Model switched to: {model}"),
+                    };
+                    let _ = tx_events.send(AgentEvent::System(msg));
+                }
             }
             WorkerCmd::SetCwd(path) => {
                 *agent.cwd.lock().unwrap() = Some(path.clone());
@@ -172,15 +183,15 @@ async fn agent_worker(
             WorkerCmd::UserInput(user_input) => {
                 agent.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                 let tx = tx_events.clone();
+                let tx_tool = tx_events.clone();
                 tokio::select! {
                     result = agent.chat_streaming(&user_input, move |chunk| {
                         let _ = tx.send(AgentEvent::TextChunk(chunk.to_string()));
+                    }, move |tool_name| {
+                        let _ = tx_tool.send(AgentEvent::ToolCall(tool_name.to_string()));
                     }) => {
                         match result {
                             Ok(resp) => {
-                                for tool in &resp.tool_calls {
-                                    let _ = tx_events.send(AgentEvent::ToolCall(tool.clone()));
-                                }
                                 let _ = tx_events.send(AgentEvent::Done {
                                     _tool_calls: resp.tool_calls,
                                     usage: resp.usage,
@@ -285,17 +296,37 @@ async fn run_event_loop(
     let mut app = App::new(session_id);
     let mut key_stream = EventStream::new();
 
-    // Timer for animation ticks.
-    let mut tick_interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut last_tick = tokio::time::Instant::now();
+    let tick_rate = std::time::Duration::from_millis(200);
+    // Fixed poll interval — short enough for smooth streaming, long enough to save CPU.
+    let poll_interval = std::time::Duration::from_millis(16); // ~60fps
 
     loop {
+        // ── 1. Drain ALL pending agent events ────────────────────────────────
+        while let Ok(event) = rx_events.try_recv() {
+            handle_agent_event(&mut app, event);
+        }
+
+        // ── 2. Animation tick (every 200ms) ──────────────────────────────────
+        if last_tick.elapsed() >= tick_rate {
+            last_tick = tokio::time::Instant::now();
+            app.tick = app.tick.wrapping_add(1);
+            app.buddy_tick();
+            if app.agent_state == AgentState::Idle
+                && app.buddy_reaction.is_none()
+                && app.tick % 60 == 0
+            {
+                app.buddy_react(buddy::BuddyEvent::Idle);
+            }
+        }
+
+        // ── 3. Draw ──────────────────────────────────────────────────────────
         terminal.draw(|frame| render(frame, &mut app))?;
 
+        // ── 4. Wait for keyboard OR short poll timeout ──────────────────────
         tokio::select! {
-            _ = tick_interval.tick() => {
-                // Send a tick event through the regular event channel via a local bump.
-                app.tick = app.tick.wrapping_add(1);
-            }
+            // Poll timeout — guarantees redraw even with no keyboard input.
+            _ = tokio::time::sleep(poll_interval) => {}
 
             Some(Ok(event)) = key_stream.next() => {
                 // Bracketed paste — insert pasted text as-is.
@@ -314,8 +345,6 @@ async fn run_event_loop(
                     continue;
                 }
                 if let Event::Key(key) = event {
-                    // Only process key-press events — on Windows crossterm
-                    // fires both Press and Release, causing duplicate input.
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -334,7 +363,6 @@ async fn run_event_loop(
                             app.clear_input();
                             continue;
                         } else {
-                            // idle: exit like Ctrl+D
                             return Ok(());
                         }
                     }
@@ -383,7 +411,7 @@ async fn run_event_loop(
                                 if let Some(label) = app.completion.selected_label() {
                                     let is_enter = key.code == KeyCode::Enter;
                                     match app.completion.kind {
-                                        app::CompletionKind::Command => {
+                                        completion::CompletionKind::Command => {
                                             let needs_arg = matches!(label,
                                                 "/model" | "/commit" | "/cd" | "/resume" |
                                                 "/memory" | "/worktree" | "/plan"
@@ -393,23 +421,22 @@ async fn run_event_loop(
                                                 app.cursor_pos = app.input.chars().count();
                                                 app.completion.update(&app.input);
                                             } else {
-                                                // No-arg command: fill and execute on Enter.
                                                 app.input = label.to_string();
                                                 app.completion.dismiss();
                                                 if is_enter {
                                                     let input = app.take_input();
-                                                    handle_user_input(&mut app, input, &tx_input).await;
+                                                    commands::handle_user_input(&mut app, input, &tx_input).await;
                                                 } else {
                                                     app.cursor_pos = app.input.chars().count();
                                                 }
                                             }
                                         }
-                                        app::CompletionKind::Model => {
+                                        completion::CompletionKind::Model => {
                                             app.input = format!("/model {}", label);
                                             app.completion.dismiss();
                                             if is_enter {
                                                 let input = app.take_input();
-                                                handle_user_input(&mut app, input, &tx_input).await;
+                                                commands::handle_user_input(&mut app, input, &tx_input).await;
                                             } else {
                                                 app.cursor_pos = app.input.chars().count();
                                             }
@@ -433,7 +460,7 @@ async fn run_event_loop(
                                 return Ok(());
                             }
                             if !input.trim().is_empty() {
-                                handle_user_input(&mut app, input, &tx_input).await;
+                                commands::handle_user_input(&mut app, input, &tx_input).await;
                             }
                         }
                         KeyCode::Tab => {} // no-op outside completion
@@ -476,279 +503,60 @@ async fn run_event_loop(
                 }
             }
 
-            Some(event) = rx_events.recv() => {
-                match event {
-                    AgentEvent::TextChunk(chunk) => app.append_assistant_chunk(&chunk),
-                    AgentEvent::ToolCall(name) => app.push_tool_call(&name),
-                    AgentEvent::Done { _tool_calls: _, usage } => app.finish_response(&usage),
-                    AgentEvent::System(msg) => app.push_system(msg),
-
-                    AgentEvent::Error(err) => {
-                        // Extract a human-readable message from JSON errors.
-                        let msg = extract_error_message(&err);
-                        app.push_system(format!("Error: {msg}"));
-                        app.agent_state = AgentState::Idle;
-                    }
-                    AgentEvent::PipelineStep { index, total, label, done, text } => {
-                        let step_label = match label.as_str() {
-                            "product" => "Product",
-                            "architecture" => "Architecture",
-                            "implementation" => "Implementation",
-                            other => other,
-                        };
-                        if !done {
-                            app.push_system(format!(
-                                "  [{}/{}] * {} ...",
-                                index + 1, total, step_label
-                            ));
-                            app.agent_state = AgentState::Thinking;
-                        } else {
-                            app.push_system(format!(
-                                "  [{}/{}] + {} done",
-                                index + 1, total, step_label
-                            ));
-                            if let Some(t) = text {
-                                app.chat_history.push(crate::app::ChatEntry {
-                                    role: crate::app::ChatRole::Assistant,
-                                    content: t,
-                                });
-                            }
-                            if index + 1 == total {
-                                app.agent_state = AgentState::Idle;
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }
 
-async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender<WorkerCmd>) {
-    // ── Slash commands ────────────────────────────────────────────────────────
-    if input.starts_with('/') {
-        let cmd = input.trim();
-        match cmd {
-            "/help" => {
-                app.push_system(
-                    "/help  /clear  /session  /sessions  /resume <id>\n  \
-                     /model [name]  /compact  /commit [msg]  /memory [note]\n  \
-                     /cd <path>  /pwd  /worktree <branch>\n  \
-                     /agents                list available agent types\n  \
-                     /plan <prompt>         run 3-step product→arch→impl pipeline\n  \
-                     exit|quit"
-                );
-            }
-            "/clear" => {
-                app.chat_history.clear();
-                app.scroll_offset = 0;
-                app.push_system("Chat history cleared.");
-            }
-            "/session" => {
-                if let Some(id) = &app.session_id {
-                    app.push_system(format!("Session: {id}"));
-                } else {
-                    app.push_system("No active session.");
-                }
-            }
-            "/model" => {
-                app.push_system(format!("Current model: {}", app.model_name));
-            }
-            "/sessions" => {
-                match Storage::new().and_then(|s| s.list()) {
-                    Ok(ids) if ids.is_empty() => app.push_system("No saved sessions."),
-                    Ok(ids) => {
-                        let list = ids.join("\n  ");
-                        app.push_system(format!("Saved sessions:\n  {list}"));
-                    }
-                    Err(e) => app.push_system(format!("Error listing sessions: {e}")),
-                }
-            }
-            "/compact" => {
-                if tx_input.send(WorkerCmd::Compact).await.is_err() {
-                    app.push_system("Agent worker stopped unexpectedly.");
-                }
-            }
-            "/memory" => {
-                match iris_memory::load_notes() {
-                    Ok(notes) if notes.is_empty() => app.push_system("No notes saved yet. Use /memory <text> to add one."),
-                    Ok(notes) => app.push_system(format!("Notes:\n{notes}")),
-                    Err(e) => app.push_system(format!("Error reading notes: {e}")),
-                }
-            }
-            "/pwd" => {
-                if tx_input.send(WorkerCmd::ResetCwd).await.is_err() {}
-                let cwd = std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "unknown".to_string());
-                app.push_system(format!("Process cwd: {cwd}"));
-            }
-            "/commit" => {
-                let output = std::process::Command::new("git")
-                    .args(["status", "--short"])
-                    .output();
-                match output {
-                    Ok(o) => {
-                        let s = String::from_utf8_lossy(&o.stdout);
-                        if s.trim().is_empty() {
-                            app.push_system("Nothing to commit (working tree clean).");
-                        } else {
-                            app.push_system(format!("Staged/unstaged changes:\n{s}\nUse /commit <message> to commit."));
-                        }
-                    }
-                    Err(e) => app.push_system(format!("git error: {e}")),
-                }
-            }
-            _ if cmd.starts_with("/memory ") => {
-                let note = cmd.trim_start_matches("/memory ").trim();
-                match iris_memory::add_note(note) {
-                    Ok(()) => app.push_system(format!("Note saved: {note}")),
-                    Err(e) => app.push_system(format!("Error saving note: {e}")),
-                }
-            }
-            _ if cmd.starts_with("/commit ") => {
-                let msg = cmd.trim_start_matches("/commit ").trim().to_string();
-                let output = std::process::Command::new("git")
-                    .args(["add", "-A"])
-                    .output()
-                    .and_then(|_| {
-                        std::process::Command::new("git")
-                            .args(["commit", "-m", &msg])
-                            .output()
-                    });
-                match output {
-                    Ok(o) => {
-                        let stdout = String::from_utf8_lossy(&o.stdout);
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        let out = if !stdout.trim().is_empty() { stdout.as_ref() } else { stderr.as_ref() };
-                        app.push_system(format!("git commit:\n{}", out.trim()));
-                    }
-                    Err(e) => app.push_system(format!("git error: {e}")),
-                }
-            }
-            _ if cmd.starts_with("/cd ") => {
-                let path_str = cmd.trim_start_matches("/cd ").trim();
-                let path = std::path::PathBuf::from(path_str);
-                if path.is_dir() {
-                    let abs = path.canonicalize().unwrap_or(path);
-                    if tx_input.send(WorkerCmd::SetCwd(abs)).await.is_err() {
-                        app.push_system("Agent worker stopped unexpectedly.");
-                    }
-                } else {
-                    app.push_system(format!("Not a directory: {path_str}"));
-                }
-            }
-            "/cd" => {
-                if tx_input.send(WorkerCmd::ResetCwd).await.is_err() {
-                    app.push_system("Agent worker stopped unexpectedly.");
-                }
-            }
-            _ if cmd.starts_with("/worktree ") => {
-                let branch = cmd.trim_start_matches("/worktree ").trim().to_string();
-                let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-                let wt_path = home.join(".code-iris").join("worktrees").join(&branch);
-                let create = std::process::Command::new("git")
-                    .args(["worktree", "add", &wt_path.to_string_lossy(), "-b", &branch])
-                    .output();
-                match create {
-                    Ok(o) if o.status.success() => {
-                        if tx_input.send(WorkerCmd::SetCwd(wt_path.clone())).await.is_err() {
-                            app.push_system("Agent worker stopped unexpectedly.");
-                        } else {
-                            app.push_system(format!("Worktree created and cwd set to {}", wt_path.display()));
-                        }
-                    }
-                    Ok(o) => {
-                        let e = String::from_utf8_lossy(&o.stderr);
-                        app.push_system(format!("git worktree add failed: {}", e.trim()));
-                    }
-                    Err(e) => app.push_system(format!("git error: {e}")),
-                }
-            }
-            "/agents" => {
-                use iris_core::agent_def::{builtin_agents, load_custom_agents, SandboxMode};
-                let mut lines = vec!["Available agent types:\n".to_string()];
-                let custom = load_custom_agents(None);
-                if !custom.is_empty() {
-                    lines.push("  Custom:".to_string());
-                    for def in &custom {
-                        let mode = match def.sandbox_mode {
-                            SandboxMode::ReadOnly => "read-only",
-                            SandboxMode::Full => "full",
-                        };
-                        let model_hint = def.model.as_deref().unwrap_or("inherit");
-                        lines.push(format!("  • {} [{}] ({}) — {}", def.name, mode, model_hint, def.description));
-                    }
-                    lines.push(String::new());
-                }
-                lines.push("  Built-in:".to_string());
-                for def in builtin_agents() {
-                    let mode = match def.sandbox_mode {
-                        SandboxMode::ReadOnly => "read-only",
-                        SandboxMode::Full => "full",
-                    };
-                    let model_hint = def.model.as_deref().unwrap_or("inherit");
-                    lines.push(format!("  • {} [{}] ({}) — {}", def.name, mode, model_hint, def.description));
-                }
-                lines.push(String::new());
-                lines.push("Use in CLI: iris run --pipeline --sub \"step@explorer:prompt\"".to_string());
-                app.push_system(lines.join("\n"));
-            }
-
-            "/buddy" => {
-                let buddy = app::roll_buddy();
-                app.buddy = Some(buddy);
-                let (r, g, b) = buddy.rarity.color();
-                let rarity_label = buddy.rarity.label();
+fn handle_agent_event(app: &mut App, event: AgentEvent) {
+    match event {
+        AgentEvent::TextChunk(chunk) => {
+            app.append_assistant_chunk(&chunk);
+        }
+        AgentEvent::ToolCall(name) => {
+            app.push_tool_call(&name);
+            app.buddy_react(buddy::BuddyEvent::ToolCall);
+        }
+        AgentEvent::Done { _tool_calls: _, usage } => {
+            app.finish_response(&usage);
+            app.buddy_react(buddy::BuddyEvent::Done);
+        }
+        AgentEvent::System(msg) => app.push_system(msg),
+        AgentEvent::ModelSwitched { actual_model } => {
+            app.model_name = actual_model;
+        }
+        AgentEvent::Error(err) => {
+            let msg = extract_error_message(&err);
+            app.push_system(format!("Error: {msg}"));
+            app.agent_state = AgentState::Idle;
+            app.buddy_react(buddy::BuddyEvent::Error);
+        }
+        AgentEvent::PipelineStep { index, total, label, done, text } => {
+            let step_label = match label.as_str() {
+                "product" => "Product",
+                "architecture" => "Architecture",
+                "implementation" => "Implementation",
+                other => other,
+            };
+            if !done {
                 app.push_system(format!(
-                    "\n  {} {} ({})  [{}] {}\n\n  \"{} is now watching your code.\"\n",
-                    buddy.face, buddy.name, buddy.name_cn,
-                    rarity_label, buddy.trait_name,
-                    buddy.name,
+                    "  [{}/{}] * {} ...", index + 1, total, step_label
                 ));
-                let _ = (r, g, b); // used by statusbar rendering
-            }
-
-            _ if cmd.starts_with("/plan ") => {
-                let prompt = cmd.trim_start_matches("/plan ").trim().to_string();
-                if prompt.is_empty() {
-                    app.push_system("Usage: /plan <requirement>");
-                } else {
-                    app.push_user(format!("/plan {prompt}"));
-                    if tx_input.send(WorkerCmd::Plan(prompt)).await.is_err() {
-                        app.push_system("Agent worker stopped unexpectedly.");
-                    }
+                app.agent_state = AgentState::Thinking;
+            } else {
+                app.push_system(format!(
+                    "  [{}/{}] + {} done", index + 1, total, step_label
+                ));
+                if let Some(t) = text {
+                    app.chat_history.push(crate::app::ChatEntry {
+                        role: crate::app::ChatRole::Assistant,
+                        content: t,
+                    });
                 }
-            }
-
-            _ if cmd.starts_with("/resume ") => {
-                let id = cmd.trim_start_matches("/resume ").trim().to_string();
-                if tx_input.send(WorkerCmd::LoadSession(id)).await.is_err() {
-                    app.push_system("Agent worker stopped unexpectedly.");
+                if index + 1 == total {
+                    app.agent_state = AgentState::Idle;
                 }
-            }
-            _ if cmd.starts_with("/model ") => {
-                let m = cmd.trim_start_matches("/model ").trim().to_string();
-                app.model_name = m.clone();
-                if tx_input.send(WorkerCmd::SetModel(m)).await.is_err() {
-                    app.push_system("Agent worker stopped unexpectedly.");
-                }
-            }
-            _ => {
-                app.push_system(format!("Unknown command: {cmd}  (type /help)"));
             }
         }
-        return;
-    }
-
-    if !app.has_api_key {
-        app.push_system("No API key found — set ANTHROPIC_API_KEY or DASHSCOPE_API_KEY etc.");
-        return;
-    }
-    app.push_user(&input);
-    if tx_input.send(WorkerCmd::UserInput(input)).await.is_err() {
-        app.push_system("Agent worker stopped unexpectedly.");
-        app.agent_state = AgentState::Idle;
     }
 }
 
@@ -756,11 +564,14 @@ async fn handle_user_input(app: &mut App, input: String, tx_input: &mpsc::Sender
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let input_h = app.input_height();
+    let input_h = app.input_height_for_width(area.width);
+    let thinking_h = if app.agent_state != AgentState::Idle { 1 } else { 0 };
     let layout = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(input_h),
-        Constraint::Length(1),
+        Constraint::Min(1),                   // chat area
+        Constraint::Length(thinking_h as u16), // thinking indicator (0 when idle)
+        Constraint::Length(input_h),           // input box
+        Constraint::Length(1),                 // status bar
+        Constraint::Length(2),                 // bottom padding
     ])
     .split(area);
 
@@ -768,12 +579,21 @@ fn render(frame: &mut Frame, app: &mut App) {
         AppMode::Welcome => welcome::render(frame, layout[0], app),
         AppMode::Chat => render_chat(frame, layout[0], app),
     }
-    input::render(frame, layout[1], app);
-    statusbar::render(frame, layout[2], app);
+    // ── Thinking indicator (fixed above input) ───────────────────────
+    if app.agent_state != AgentState::Idle {
+        render_thinking(frame, layout[1], app);
+    }
+    input::render(frame, layout[2], app);
+    statusbar::render(frame, layout[3], app);
 
-    // ── Completion popup (rendered last as overlay) ───────────────────────
+    // ── Buddy sprite overlay (bottom-right corner of chat) ───────────
+    if app.buddy.is_some() {
+        render_buddy_sprite(frame, layout[0], app);
+    }
+
+    // ── Completion popup (rendered last as overlay) ───────────────────
     if app.completion.visible && !app.completion.items.is_empty() {
-        render_completion(frame, layout[1], app);
+        render_completion(frame, layout[2], app);
     }
 }
 
@@ -784,12 +604,10 @@ fn render_completion(frame: &mut Frame, input_area: Rect, app: &App) {
     let item_count = app.completion.items.len().min(10) as u16;
     let menu_h = item_count + 2; // +2 for borders
 
-    // Position above the input area.
     let menu_y = input_area.y.saturating_sub(menu_h);
     let menu_w = 60u16.min(input_area.width);
     let menu_area = Rect::new(input_area.x + 2, menu_y, menu_w, menu_h);
 
-    // Clear the area behind the popup.
     frame.render_widget(Clear, menu_area);
 
     let lines: Vec<Line> = app.completion.items.iter().enumerate().map(|(i, (label, desc))| {
@@ -825,11 +643,136 @@ fn render_completion(frame: &mut Frame, input_area: Rect, app: &App) {
     frame.render_widget(paragraph, menu_area);
 }
 
-/// Spinner frames for the thinking indicator.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Render buddy sprite as ambient overlay in the bottom-right corner,
+/// with name label below and optional speech bubble to the left.
+/// Only renders when idle — hides during streaming to avoid text overlap.
+fn render_buddy_sprite(frame: &mut Frame, chat_area: Rect, app: &App) {
+    use ratatui::widgets::Clear;
+
+    let Some(companion) = &app.buddy else { return };
+
+    let sprite_lines = buddy::render_sprite(&companion.bones, app.tick);
+    let sprite_h = sprite_lines.len() as u16;
+    let sprite_w: u16 = sprite_lines.iter()
+        .map(|l| l.len() as u16)
+        .max()
+        .unwrap_or(12)
+        + 2; // minimal padding
+
+    let name_line = 1u16;
+    let total_h = sprite_h + name_line;
+
+    // Position: bottom-right of chat area, with margin.
+    let x = chat_area.right().saturating_sub(sprite_w + 1);
+    let y = chat_area.bottom().saturating_sub(total_h + 1);
+
+    if sprite_w > chat_area.width / 3 || total_h + 2 > chat_area.height {
+        return;
+    }
+
+    let (r, g, b) = companion.bones.rarity.color();
+    let style = Style::default().fg(Color::Rgb(r, g, b));
+    let dim_style = Style::default().fg(Color::Rgb(r / 2, g / 2, b / 2));
+
+    // ── Sprite ───────────────────────────────────────────────────────────────
+    let sprite_area = Rect::new(x, y, sprite_w, sprite_h);
+    frame.render_widget(Clear, sprite_area);
+
+    let lines: Vec<Line> = sprite_lines.iter()
+        .map(|l| Line::from(Span::styled(format!(" {l}"), style)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), sprite_area);
+
+    // ── Name label ───────────────────────────────────────────────────────────
+    let name = &companion.soul.name;
+    let name_w = (name.chars().count() as u16 + 2).min(sprite_w);
+    let name_x = x + (sprite_w.saturating_sub(name_w)) / 2;
+    let name_area = Rect::new(name_x, y + sprite_h, name_w, 1);
+    frame.render_widget(Clear, name_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            name.to_string(),
+            dim_style.italic(),
+        )).alignment(Alignment::Center)),
+        name_area,
+    );
+
+    // ── Speech bubble (if reaction active) ───────────────────────────────────
+    if let Some(reaction) = &app.buddy_reaction {
+        if reaction.is_visible() {
+            let text = &reaction.text;
+            let bubble_inner_w = text.chars().count().min(24);
+            let bubble_w = bubble_inner_w as u16 + 4;
+            let bubble_h = 3u16;
+
+            let bx = x.saturating_sub(bubble_w + 1);
+            let by = y + (sprite_h.saturating_sub(bubble_h)) / 2;
+
+            if bx >= chat_area.x && by + bubble_h <= chat_area.bottom() {
+                let bubble_area = Rect::new(bx, by, bubble_w, bubble_h);
+                frame.render_widget(Clear, bubble_area);
+
+                let bubble_style = if reaction.is_fading() {
+                    Style::default().fg(Color::Rgb(60, 60, 60))
+                } else {
+                    Style::default().fg(Color::Rgb(140, 140, 110))
+                };
+
+                let truncated: String = text.chars().take(bubble_inner_w).collect();
+                let inner_w = bubble_w as usize - 4;
+                let top = format!("╭{}╮", "─".repeat(inner_w + 2));
+                let mid = format!("│ {:<w$} │", truncated, w = inner_w);
+                let bot = format!("╰{}╯", "─".repeat(inner_w + 2));
+
+                let bubble_lines = vec![
+                    Line::from(Span::styled(top, bubble_style)),
+                    Line::from(Span::styled(mid, bubble_style)),
+                    Line::from(Span::styled(bot, bubble_style)),
+                ];
+                frame.render_widget(Paragraph::new(bubble_lines), bubble_area);
+            }
+        }
+    }
+}
+
+/// Fun rotating verbs for the thinking indicator — like Claude Code.
+const THINKING_VERBS: &[&str] = &[
+    "Thinking", "Pondering", "Contemplating", "Reasoning",
+    "Gesticulating", "Cogitating", "Ruminating", "Deliberating",
+    "Cooking", "Brewing", "Conjuring", "Composing",
+];
+
+/// Render the thinking/streaming indicator as a fixed line above input.
+fn render_thinking(frame: &mut Frame, area: Rect, app: &App) {
+    let elapsed = app.turn_started_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+
+    // Pick verb based on turn hash so it stays stable within a turn.
+    let verb_seed = app.turn_started_at
+        .map(|t| t.elapsed().as_millis() as usize / 10000)
+        .unwrap_or(0);
+    let verb = THINKING_VERBS[verb_seed.wrapping_mul(7) % THINKING_VERBS.len()];
+
+    let star = if app.tick % 2 == 0 { "✦" } else { "✱" };
+    let color = Style::default().fg(Color::Rgb(230, 130, 60));
+    let dim = Style::default().fg(Color::Rgb(100, 100, 110));
+
+    let mut spans = vec![
+        Span::styled(format!("{star} "), color),
+        Span::styled(format!("{verb}…"), color),
+    ];
+
+    if elapsed > 0 {
+        spans.push(Span::styled(format!(" ({elapsed}s)"), dim));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
 
 fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut prev_role: Option<ChatRole> = None;
 
     for entry in &app.chat_history {
         match entry.role {
@@ -840,10 +783,16 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
                 ]));
             }
             ChatRole::Assistant => {
-                lines.push(Line::from(Span::styled(
-                    "iris",
-                    Style::default().fg(Color::Rgb(255, 140, 60)).bold(),
-                )));
+                // Only show "iris" header if this is the first assistant message
+                // in a turn (not after a tool call in the same turn).
+                let show_header = prev_role.as_ref() != Some(&ChatRole::Assistant)
+                    && prev_role.as_ref() != Some(&ChatRole::Tool);
+                if show_header {
+                    lines.push(Line::from(Span::styled(
+                        "iris",
+                        Style::default().fg(Color::Rgb(255, 140, 60)).bold(),
+                    )));
+                }
                 for md_line in markdown::render_markdown(&entry.content) {
                     let mut indented = vec![Span::raw("  ")];
                     indented.extend(md_line.spans);
@@ -851,78 +800,59 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
                 }
             }
             ChatRole::Tool => {
-                // Parse tool name and content preview from "⚙  tool_name" format.
                 let raw = entry.content.trim_start_matches('⚙').trim();
-                // raw is e.g. "bash" or "bash\narg..." depending on push_tool_call
                 let (tool_name, preview) = if let Some(nl) = raw.find('\n') {
                     (&raw[..nl], raw[nl + 1..].trim())
                 } else {
                     (raw, "")
                 };
+                // Dim, compact tool indicator — "thinking" process, not the answer.
+                let dim = Style::default().fg(Color::Rgb(90, 90, 100));
                 let mut spans = vec![
-                    Span::raw("  "),
-                    Span::styled("⟩ ", Style::default().fg(Color::Rgb(100, 150, 255))),
-                    Span::styled(
-                        tool_name.to_string(),
-                        Style::default().fg(Color::Rgb(100, 150, 255)).bold(),
-                    ),
+                    Span::styled("  ⎿ ", dim),
+                    Span::styled(tool_name.to_string(), dim.bold()),
                 ];
                 if !preview.is_empty() {
-                    let truncated: String = preview.chars().take(80).collect();
-                    let ellipsis = if preview.chars().count() > 80 { "…" } else { "" };
-                    spans.push(Span::raw("  "));
+                    let truncated: String = preview.chars().take(60).collect();
+                    let ellipsis = if preview.chars().count() > 60 { "…" } else { "" };
                     spans.push(Span::styled(
-                        format!("{truncated}{ellipsis}"),
-                        Style::default().fg(Color::Rgb(120, 120, 120)).italic(),
+                        format!(" {truncated}{ellipsis}"),
+                        dim.italic(),
                     ));
                 }
                 lines.push(Line::from(spans));
             }
             ChatRole::System => {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", entry.content),
-                    Style::default().fg(Color::Rgb(200, 80, 80)).italic(),
-                )));
+                for sys_line in entry.content.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {sys_line}"),
+                        Style::default().fg(Color::Rgb(200, 80, 80)).italic(),
+                    )));
+                }
             }
         }
-        // No blank line after tool calls — they stack compactly.
-        if entry.role != ChatRole::Tool {
+        prev_role = Some(entry.role.clone());
+        // Minimal spacing: only add a blank line after Assistant blocks.
+        if entry.role == ChatRole::Assistant {
             lines.push(Line::from(""));
         }
     }
 
-    match app.agent_state {
-        AgentState::Thinking => {
-            let frame_char = SPINNER[app.tick as usize % SPINNER.len()];
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{frame_char} thinking…"),
-                    Style::default().fg(Color::Rgb(150, 150, 150)).italic(),
-                ),
-            ]));
-        }
-        AgentState::Streaming => {
-            let frame_char = SPINNER[app.tick as usize % SPINNER.len()];
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(frame_char, Style::default().fg(Color::Rgb(255, 140, 60))),
-                Span::styled(" ▋", Style::default().fg(Color::Rgb(255, 140, 60))),
-            ]));
-        }
-        AgentState::Idle => {}
-    }
-
-    let total_lines = lines.len();
-    let visible = area.height.saturating_sub(2) as usize;
+    // Use ratatui's exact line_count for accurate scroll (requires unstable feature).
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total_lines = paragraph.line_count(area.width);
+    let visible = area.height as usize;
     let max_scroll = total_lines.saturating_sub(visible);
     app.last_max_scroll = max_scroll;
-    let scroll = app.scroll_offset.min(max_scroll);
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll as u16, 0));
+    // Auto-scroll: stick to bottom unless user manually scrolled up.
+    let scroll = if !app.user_scrolled {
+        max_scroll
+    } else {
+        app.scroll_offset.min(max_scroll)
+    };
 
+    let paragraph = paragraph.scroll((scroll as u16, 0));
     frame.render_widget(paragraph, area);
 
     if total_lines > visible {
@@ -933,13 +863,9 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 /// Extract a human-readable message from API error strings.
-///
-/// Many providers return JSON with `"message":"..."`.  This pulls out
-/// just the message text without requiring serde_json.
 fn extract_error_message(raw: &str) -> String {
-    // Look for "message":"<text>" pattern in JSON error responses.
     if let Some(start) = raw.find("\"message\":\"") {
-        let after = &raw[start + 11..]; // skip `"message":"`
+        let after = &raw[start + 11..];
         if let Some(end) = after.find('"') {
             let msg = &after[..end];
             if !msg.is_empty() {
@@ -947,7 +873,6 @@ fn extract_error_message(raw: &str) -> String {
             }
         }
     }
-    // Fallback: use the last meaningful line.
     raw.lines()
         .rev()
         .find(|l| !l.trim().is_empty())

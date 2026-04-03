@@ -40,6 +40,14 @@ struct GeminiContent {
 #[derive(Debug, Deserialize)]
 struct GeminiPart {
     text: Option<String>,
+    #[serde(rename = "functionCall")]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiFunctionCall {
+    name: String,
+    args: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,7 +134,7 @@ impl GoogleProvider {
     pub async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
         config: &ModelConfig,
     ) -> Result<impl Stream<Item = Result<StreamEvent>>> {
         let url = format!(
@@ -151,6 +159,18 @@ impl GoogleProvider {
         }
         if let Some(temp) = config.temperature {
             body["generationConfig"]["temperature"] = json!(temp);
+        }
+
+        // Gemini function calling format.
+        if !tools.is_empty() {
+            let declarations: Vec<Value> = tools.iter().map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                })
+            }).collect();
+            body["tools"] = json!([{"function_declarations": declarations}]);
         }
 
         // Retry on transient errors.
@@ -216,7 +236,7 @@ impl GoogleProvider {
                         yield Ok(StreamEvent::MessageStop);
                         return;
                     }
-                    // Extract text parts and emit deltas.
+                    // Extract text and function call parts.
                     if let Some(content) = candidate.content {
                         for part in content.parts.unwrap_or_default() {
                             if let Some(full_text) = part.text {
@@ -226,6 +246,14 @@ impl GoogleProvider {
                                     emitted_text = full_text;
                                     yield Ok(StreamEvent::TextDelta { text: delta });
                                 }
+                            }
+                            if let Some(fc) = part.function_call {
+                                let id = format!("gemini_{}", fc.name);
+                                yield Ok(StreamEvent::ToolUse {
+                                    id,
+                                    name: fc.name,
+                                    input: fc.args.unwrap_or(json!({})),
+                                });
                             }
                         }
                     }
