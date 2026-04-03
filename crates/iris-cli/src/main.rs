@@ -487,7 +487,7 @@ async fn cmd_doc_sync(since: String, path: PathBuf, model: Option<String>) -> Re
     );
 
     // 3. Run a single agent to detect drift.
-    let mut agent = Agent::from_env()
+    let mut agent = Agent::from_env().await
         .context("No API key found. Run `iris configure`.")?;
     if let Some(m) = model {
         agent = agent.with_model(m);
@@ -518,7 +518,24 @@ async fn cmd_doc_sync(since: String, path: PathBuf, model: Option<String>) -> Re
             io::stdout().flush().ok();
         }, |tool| {
             eprintln!("\x1b[90m  ⎿ {tool}\x1b[0m");
-        })
+        }, |_name, result, is_error| {
+            if is_error {
+                eprintln!("\x1b[31m  ⚠ {}\x1b[0m", result.lines().next().unwrap_or(""));
+            } else if result.contains("--- ") {
+                // Print diff with ANSI colors.
+                for line in result.lines().skip_while(|l| !l.starts_with("--- ")) {
+                    if line.starts_with('+') && !line.starts_with("+++") {
+                        eprintln!("\x1b[32m    {line}\x1b[0m");
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        eprintln!("\x1b[31m    {line}\x1b[0m");
+                    } else if line.starts_with("@@") {
+                        eprintln!("\x1b[36m    {line}\x1b[0m");
+                    } else {
+                        eprintln!("\x1b[90m    {line}\x1b[0m");
+                    }
+                }
+            }
+        }, |_thinking| {})
         .await?;
 
     if !response.text.ends_with('\n') {
@@ -575,7 +592,7 @@ async fn cmd_chat(
     auto: bool,
     plan: bool,
 ) -> Result<()> {
-    let mut agent = Agent::from_env()
+    let mut agent = Agent::from_env().await
         .context("No API key found. Set ANTHROPIC_API_KEY / DASHSCOPE_API_KEY / DEEPSEEK_API_KEY etc., or run `iris configure`.")?;
 
     if let Some(m) = model {
@@ -652,7 +669,23 @@ async fn cmd_chat(
                 io::stdout().flush().ok();
             }, |tool| {
                 eprintln!("\x1b[90m  ⎿ {tool}\x1b[0m");
-            })
+            }, |_name, result, is_error| {
+                if is_error {
+                    eprintln!("\x1b[31m  ⚠ {}\x1b[0m", result.lines().next().unwrap_or(""));
+                } else if result.contains("--- ") {
+                    for line in result.lines().skip_while(|l| !l.starts_with("--- ")) {
+                        if line.starts_with('+') && !line.starts_with("+++") {
+                            eprintln!("\x1b[32m    {line}\x1b[0m");
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            eprintln!("\x1b[31m    {line}\x1b[0m");
+                        } else if line.starts_with("@@") {
+                            eprintln!("\x1b[36m    {line}\x1b[0m");
+                        } else {
+                            eprintln!("\x1b[90m    {line}\x1b[0m");
+                        }
+                    }
+                }
+            }, |_thinking| {})
             .await?;
 
         if !response.text.ends_with('\n') {

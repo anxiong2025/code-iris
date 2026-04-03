@@ -44,15 +44,16 @@ pub struct ContextConfig {
 }
 
 /// Fraction of `max_tokens` at which Level-4 autocompact fires proactively.
-/// 0.8 = trigger at 80 % of the context window, matching Claude Code behaviour.
-pub const AUTOCOMPACT_THRESHOLD: f32 = 0.8;
+/// 0.6 = trigger at 60 % of the context window — more aggressive than default
+/// to avoid the 200k+ token bills seen with tool-heavy sessions.
+pub const AUTOCOMPACT_THRESHOLD: f32 = 0.6;
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             max_tokens: 200_000,       // full claude-sonnet context window
-            max_tool_result_tokens: 8_000,
-            keep_recent_turns: 6,
+            max_tool_result_tokens: 4_000, // ~16 KB — enough for most file reads, keeps costs down
+            keep_recent_turns: 4,
         }
     }
 }
@@ -77,18 +78,56 @@ pub fn count_tokens(messages: &[Message]) -> usize {
 /// **Level 1** — Truncate oversized tool results in-place.
 ///
 /// Tool results that exceed `max_tool_result_tokens` are replaced with a
-/// truncated version plus a notice.
+/// head+tail truncated version so we keep both the beginning (structure/headers)
+/// and the end (often contains error messages or final output).
 pub fn truncate_tool_results(messages: &mut Vec<Message>, max_tokens: usize) {
     for msg in messages.iter_mut() {
         for block in msg.content.iter_mut() {
             if let ContentBlock::ToolResult { content, .. } = block {
                 if estimate_tokens(content) > max_tokens {
                     let char_limit = max_tokens * 4;
-                    let truncated: String = content.chars().take(char_limit).collect();
+                    let head_chars = char_limit * 3 / 4; // 75% head
+                    let tail_chars = char_limit / 4;      // 25% tail
+                    let total_chars = content.chars().count();
+                    let head: String = content.chars().take(head_chars).collect();
+                    let tail: String = content.chars().skip(total_chars.saturating_sub(tail_chars)).collect();
+                    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
                     *content = format!(
-                        "{truncated}\n\n[… output truncated, {} chars omitted]",
-                        content.len().saturating_sub(char_limit)
+                        "{head}\n\n[… {omitted} chars omitted …]\n\n{tail}"
                     );
+                }
+            }
+        }
+    }
+}
+
+/// **Level 1.5** — Evict tool results from old turns.
+///
+/// Tool results older than `keep_recent` turns are replaced with a one-line
+/// summary "[tool result: N chars]" to dramatically reduce token usage in
+/// long conversations where tools are called repeatedly (file reads, greps, etc.).
+pub fn evict_old_tool_results(messages: &mut Vec<Message>, keep_recent: usize) {
+    // Find user message indices as turn boundaries.
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .collect();
+
+    if user_indices.len() <= keep_recent {
+        return;
+    }
+
+    // Everything before the Nth-from-last user message is "old".
+    let cutoff = user_indices[user_indices.len() - keep_recent];
+
+    for msg in &mut messages[..cutoff] {
+        for block in msg.content.iter_mut() {
+            if let ContentBlock::ToolResult { content, .. } = block {
+                let tokens = estimate_tokens(content);
+                if tokens > 50 {
+                    *content = format!("[tool output: ~{tokens} tokens, evicted to save context]");
                 }
             }
         }
@@ -167,6 +206,12 @@ pub fn compress(messages: &mut Vec<Message>, config: &ContextConfig) -> bool {
 
     // Level 1: truncate big tool results.
     truncate_tool_results(messages, config.max_tool_result_tokens);
+    if count_tokens(messages) <= config.max_tokens {
+        return true;
+    }
+
+    // Level 1.5: evict old tool results entirely.
+    evict_old_tool_results(messages, config.keep_recent_turns);
     if count_tokens(messages) <= config.max_tokens {
         return true;
     }
@@ -323,7 +368,7 @@ mod tests {
         let mut msgs = vec![tool_result_msg(&big)];
         truncate_tool_results(&mut msgs, 10);
         if let ContentBlock::ToolResult { content, .. } = &msgs[0].content[0] {
-            assert!(content.contains("truncated"));
+            assert!(content.contains("omitted"));
             assert!(content.len() < big.len());
         } else {
             panic!("expected ToolResult");
@@ -375,6 +420,27 @@ mod tests {
         }
         if let ContentBlock::Text { text } = &msgs[2].content[0] {
             assert_eq!(text, "recent short", "recent turn must be unchanged");
+        }
+    }
+
+    #[test]
+    fn evict_old_tool_results_preserves_recent() {
+        // 4 turns: user, tool_result, user, tool_result — keep_recent=1
+        let big = "x".repeat(1000);
+        let mut msgs = vec![
+            user_msg("u0"),
+            tool_result_msg(&big),  // old — should be evicted
+            user_msg("u1"),
+            tool_result_msg(&big),  // recent — should be preserved
+        ];
+        evict_old_tool_results(&mut msgs, 1); // keep last 1 user turn
+        // Old tool result evicted.
+        if let ContentBlock::ToolResult { content, .. } = &msgs[1].content[0] {
+            assert!(content.contains("evicted"), "old tool result should be evicted, got: {content}");
+        }
+        // Recent tool result preserved.
+        if let ContentBlock::ToolResult { content, .. } = &msgs[3].content[0] {
+            assert_eq!(content, &big, "recent tool result should be untouched");
         }
     }
 

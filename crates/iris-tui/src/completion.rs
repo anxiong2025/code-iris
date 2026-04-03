@@ -23,6 +23,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand { name: "/worktree",  description: "Create git worktree and switch" },
     SlashCommand { name: "/agents",    description: "List available agent types" },
     SlashCommand { name: "/buddy",     description: "Summon your coding buddy" },
+    SlashCommand { name: "/init",      description: "Scan project and generate instructions" },
+    SlashCommand { name: "/skills",    description: "List available skills" },
 ];
 
 /// Common model names for completion (grouped by provider).

@@ -20,6 +20,10 @@ pub enum AgentEvent {
     TextChunk(String),
     /// A tool was called (name).
     ToolCall(String),
+    /// A tool finished — shows result preview (e.g. diff) below the tool call line.
+    ToolResult { name: String, result: String, is_error: bool },
+    /// A streamed thinking chunk from the LLM (Claude extended thinking).
+    ThinkingChunk(String),
     /// The agent finished a full exchange.
     Done { _tool_calls: Vec<String>, usage: TokenUsage },
     /// A system/status message from the worker (model switch, compact result, etc.).
@@ -52,6 +56,8 @@ pub enum ChatRole {
     User,
     Assistant,
     Tool,
+    /// Tool result with diff or preview content.
+    ToolResult,
     System,
 }
 
@@ -412,6 +418,16 @@ impl App {
         self.chat_history.push(ChatEntry {
             role: ChatRole::Tool,
             content: format!("⚙  {name}"),
+        });
+        if !self.user_scrolled {
+            self.scroll_to_bottom();
+        }
+    }
+
+    pub fn push_tool_result(&mut self, content: &str) {
+        self.chat_history.push(ChatEntry {
+            role: ChatRole::ToolResult,
+            content: content.to_string(),
         });
         if !self.user_scrolled {
             self.scroll_to_bottom();

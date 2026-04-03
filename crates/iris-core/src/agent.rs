@@ -28,7 +28,7 @@ use tokio::task::JoinSet;
 use crate::context::{compress, ContextConfig};
 use crate::hooks::{HookDecision, HookRunner};
 use crate::instructions;
-use crate::permissions::{format_preview, PermissionMode};
+use crate::permissions::{format_preview, PermissionMode, PermissionRules};
 use crate::storage::{new_session, Session, Storage};
 use crate::tools::{CwdRef, ToolRegistry};
 
@@ -72,6 +72,8 @@ pub struct Agent {
     pub hooks: HookRunner,
     /// Extra instructions prepended to the system prompt (from `.iris/instructions.md`).
     pub instructions: Option<String>,
+    /// Per-tool permission rules loaded from `.iris/permissions.toml`.
+    pub permission_rules: PermissionRules,
 }
 
 impl Agent {
@@ -91,6 +93,7 @@ impl Agent {
             cancel: Arc::new(AtomicBool::new(false)),
             hooks: HookRunner::default(),
             instructions: None,
+            permission_rules: PermissionRules::default(),
         };
         agent.reload_hooks_and_instructions();
         Ok(agent)
@@ -113,6 +116,7 @@ impl Agent {
             cancel: Arc::new(AtomicBool::new(false)),
             hooks: HookRunner::default(),
             instructions: None,
+            permission_rules: PermissionRules::default(),
         };
         agent.reload_hooks_and_instructions();
         Ok(agent)
@@ -122,7 +126,7 @@ impl Agent {
     ///
     /// Priority: OAuth credentials → ANTHROPIC_API_KEY → first set env key among all providers.
     /// Also loads MCP servers from ~/.code-iris/config.toml and registers their tools.
-    pub fn from_env() -> Result<Self> {
+    pub async fn from_env() -> Result<Self> {
         use iris_llm::{detect_provider, AuthSource};
 
         // 1. OAuth / Anthropic API key
@@ -141,6 +145,7 @@ impl Agent {
                 cancel: Arc::new(AtomicBool::new(false)),
                 hooks: HookRunner::default(),
                 instructions: None,
+            permission_rules: PermissionRules::default(),
             }
         } else if let Some(info) = detect_provider() {
             // 2. Google Gemini
@@ -160,6 +165,7 @@ impl Agent {
                     cancel: Arc::new(AtomicBool::new(false)),
                     hooks: HookRunner::default(),
                     instructions: None,
+            permission_rules: PermissionRules::default(),
                 }
             // 3. Any other OpenAI-compat provider
             } else if info.name != "anthropic" && !key.is_empty() {
@@ -175,7 +181,7 @@ impl Agent {
         };
 
         // 3. Load MCP servers from config and register their tools.
-        agent.load_mcp_tools();
+        agent.load_mcp_tools().await;
         Ok(agent)
     }
 
@@ -209,6 +215,7 @@ impl Agent {
                 cancel: Arc::new(AtomicBool::new(false)),
                 hooks: HookRunner::default(),
                 instructions: None,
+            permission_rules: PermissionRules::default(),
             });
         }
 
@@ -218,25 +225,51 @@ impl Agent {
         )
     }
 
-    /// Load MCP server configs from ~/.code-iris/config.toml and register tools.
+    /// Load MCP server configs and discover + register individual tools.
     ///
-    /// Errors are logged as warnings — a missing/broken MCP server should not
-    /// prevent the agent from starting.
-    fn load_mcp_tools(&mut self) {
+    /// Loads from both global `~/.code-iris/config.toml` and project-level
+    /// `.iris/mcp.toml`. Project-level configs override global ones with
+    /// the same server name.
+    ///
+    /// Each MCP tool is registered independently with its own schema,
+    /// as `mcp__<server>__<tool_name>`.
+    async fn load_mcp_tools(&mut self) {
         use crate::config::load_config;
-        use crate::tools::mcp_tool::McpToolWrapper;
-        use iris_llm::McpClient;
+        use iris_llm::{McpClient, McpServerConfig};
+        use std::collections::HashMap;
         use std::sync::Arc;
 
-        let config = match load_config() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("failed to load config: {e}");
-                return;
-            }
-        };
+        let mut servers: HashMap<String, McpServerConfig> = HashMap::new();
 
-        for server_cfg in &config.mcp_servers {
+        // Global config.
+        if let Ok(config) = load_config() {
+            for s in config.mcp_servers {
+                servers.insert(s.name.clone(), s);
+            }
+        }
+
+        // Project-level .iris/mcp.toml (overrides global).
+        let project_root = {
+            let guard = self.cwd.lock().unwrap();
+            guard.clone().or_else(|| std::env::current_dir().ok())
+        };
+        if let Some(ref root) = project_root {
+            let mcp_path = root.join(".iris").join("mcp.toml");
+            if mcp_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&mcp_path) {
+                    #[derive(serde::Deserialize)]
+                    struct McpConfig { #[serde(default)] servers: Vec<McpServerConfig> }
+                    if let Ok(cfg) = toml::from_str::<McpConfig>(&content) {
+                        for s in cfg.servers {
+                            servers.insert(s.name.clone(), s);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Discover tools from each server.
+        for (_, server_cfg) in &servers {
             let transport = match server_cfg.to_transport() {
                 Ok(t) => t,
                 Err(e) => {
@@ -245,11 +278,19 @@ impl Agent {
                 }
             };
             let client = Arc::new(McpClient::new(transport));
-            // We can't await here (sync context), so we register a lazy wrapper
-            // that will fetch tool definitions on first use.
-            let wrapper = McpToolWrapper::new(server_cfg.name.clone(), client);
-            self.tools.register(Arc::new(wrapper));
-            tracing::info!(server = %server_cfg.name, "registered MCP server");
+            match crate::tools::mcp_tool::discover_mcp_tools(&server_cfg.name, client).await {
+                Ok(tools) => {
+                    let count = tools.len();
+                    for tool in tools {
+                        tracing::debug!(tool = %tool.registry_name, "registered MCP tool");
+                        self.tools.register(Arc::new(tool));
+                    }
+                    tracing::info!(server = %server_cfg.name, count, "MCP tools discovered");
+                }
+                Err(e) => {
+                    tracing::warn!(server = %server_cfg.name, "MCP tool discovery failed: {e}");
+                }
+            }
         }
     }
 
@@ -464,7 +505,12 @@ impl Agent {
             guard.clone().or_else(|| std::env::current_dir().ok())
         };
         self.hooks = HookRunner::load(root.as_deref());
-        self.instructions = instructions::load(root.as_deref());
+        let cwd_dir = { self.cwd.lock().unwrap().clone() };
+        self.instructions = instructions::load_with_cwd(
+            root.as_deref(),
+            cwd_dir.as_deref(),
+        );
+        self.permission_rules = PermissionRules::load(root.as_deref());
         if !self.hooks.is_empty() {
             tracing::debug!("hooks loaded from {:?}", root);
         }
@@ -477,18 +523,23 @@ impl Agent {
 
     /// Send a user message, execute any tool calls, and return the full response.
     pub async fn chat(&mut self, user_input: &str) -> Result<AgentResponse> {
-        self.chat_streaming(user_input, |_| {}, |_| {}).await
+        self.chat_streaming(user_input, |_| {}, |_| {}, |_, _, _| {}, |_| {}).await
     }
 
     /// Like [`chat`], but calls `on_text` with each streamed text delta.
     ///
-    /// `on_text` is a sync callback — safe to call from async context using
-    /// `tokio::sync::mpsc::UnboundedSender::send` or simple stdout writes.
+    /// Callbacks:
+    /// - `on_text(chunk)` — streamed text delta
+    /// - `on_tool(name)` — tool call started
+    /// - `on_tool_result(name, result, is_error)` — tool finished
+    /// - `on_thinking(chunk)` — extended thinking delta (Claude only)
     pub async fn chat_streaming(
         &mut self,
         user_input: &str,
         mut on_text: impl FnMut(&str),
         mut on_tool: impl FnMut(&str),
+        mut on_tool_result: impl FnMut(&str, &str, bool),
+        mut on_thinking: impl FnMut(&str),
     ) -> Result<AgentResponse> {
         self.cancel.store(false, Ordering::Relaxed);
         self.session.messages.push(Message::user(user_input));
@@ -535,8 +586,16 @@ impl Agent {
 
         for turn in 0..MAX_TURNS {
             // ── [1] Context compression ──────────────────────────────────────
-            // L4 autocompact at 80 % of the context window — proactive, before
-            // the window fills, matching Claude Code's behaviour.
+
+            // Always evict old tool results — cheap and saves the most tokens.
+            // This runs every turn regardless of token count.
+            crate::context::evict_old_tool_results(
+                &mut self.session.messages,
+                self.context_cfg.keep_recent_turns,
+            );
+
+            // L4 autocompact at 60 % of the context window — proactive, before
+            // the window fills, keeps total cost down.
             let token_count = crate::context::count_tokens(&self.session.messages);
             if token_count >= self.context_cfg.autocompact_at() {
                 match self.autocompact_with_provider().await {
@@ -556,6 +615,8 @@ impl Agent {
             let mut assistant_text = String::new();
             // (tool_use_id, name, input)
             let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+            // Track tool names that already had ToolUseStart events.
+            let mut started_tools: Vec<String> = Vec::new();
 
             {
                 let messages = self.session.messages.clone();
@@ -604,8 +665,20 @@ impl Agent {
                                 on_text(&text);
                                 assistant_text.push_str(&text);
                             }
-                            StreamEvent::ThinkingDelta { .. } => {}
+                            StreamEvent::ThinkingDelta { thinking } => {
+                                on_thinking(&thinking);
+                            }
+                            StreamEvent::ToolUseStart { name } => {
+                                // Immediately notify TUI that a tool call is starting.
+                                on_tool(&name);
+                                started_tools.push(name);
+                            }
                             StreamEvent::ToolUse { id, name, input } => {
+                                // Fallback: if no ToolUseStart was sent (Bedrock/Gemini),
+                                // fire on_tool now so the TUI shows the tool name.
+                                if !started_tools.iter().any(|s| s == &name) {
+                                    on_tool(&name);
+                                }
                                 tool_uses.push((id, name, input));
                             }
                             StreamEvent::Usage(u) => usage.accumulate(&u),
@@ -657,10 +730,20 @@ impl Agent {
 
             for (id, name, input) in &tool_uses {
                 tool_calls.push(name.clone());
-                on_tool(name);
-                // Permission gate
-                let preview = format_preview(name, input);
-                if !self.permissions.request(name, &preview) {
+                // Permission gate — per-tool rules take priority.
+                let rule_result = self.permissions.is_allowed_with_rules(
+                    name, input, &self.permission_rules,
+                );
+                let allowed = match rule_result {
+                    Some(true) => true,
+                    Some(false) => false, // explicit deny
+                    None => {
+                        // Needs interactive confirm.
+                        let preview = format_preview(name, input);
+                        self.permissions.request(name, &preview)
+                    }
+                };
+                if !allowed {
                     self.session.messages.push(Message::tool_result(
                         id,
                         format!("Permission denied for tool `{name}`"),
@@ -732,17 +815,22 @@ impl Agent {
                 let msg = match results.remove(id) {
                     Some(Ok(output)) => {
                         tracing::debug!(tool = %name, "succeeded");
+                        on_tool_result(name, &output, false);
                         Message::tool_result(id, output, false)
                     }
                     Some(Err(err)) => {
                         tracing::warn!(tool = %name, error = %err, "failed");
+                        on_tool_result(name, &err.to_string(), true);
                         Message::tool_result(id, err.to_string(), true)
                     }
-                    None => Message::tool_result(
-                        id,
-                        format!("Tool `{name}` produced no result"),
-                        true,
-                    ),
+                    None => {
+                        on_tool_result(name, &format!("Tool `{name}` produced no result"), true);
+                        Message::tool_result(
+                            id,
+                            format!("Tool `{name}` produced no result"),
+                            true,
+                        )
+                    }
                 };
                 self.session.messages.push(msg);
             }

@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let (tx_cancel, rx_cancel) = mpsc::channel::<()>(4);
 
     // Spawn agent worker if any provider key is available.
-    let session_id = match Agent::from_env() {
+    let session_id = match Agent::from_env().await {
         Ok(agent) => {
             let id = agent.session.id.clone();
             tokio::spawn(agent_worker(agent, rx_input, rx_cancel, tx_events));
@@ -184,11 +184,21 @@ async fn agent_worker(
                 agent.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                 let tx = tx_events.clone();
                 let tx_tool = tx_events.clone();
+                let tx_result = tx_events.clone();
+                let tx_thinking = tx_events.clone();
                 tokio::select! {
                     result = agent.chat_streaming(&user_input, move |chunk| {
                         let _ = tx.send(AgentEvent::TextChunk(chunk.to_string()));
                     }, move |tool_name| {
                         let _ = tx_tool.send(AgentEvent::ToolCall(tool_name.to_string()));
+                    }, move |name, result, is_error| {
+                        let _ = tx_result.send(AgentEvent::ToolResult {
+                            name: name.to_string(),
+                            result: result.to_string(),
+                            is_error,
+                        });
+                    }, move |thinking| {
+                        let _ = tx_thinking.send(AgentEvent::ThinkingChunk(thinking.to_string()));
                     }) => {
                         match result {
                             Ok(resp) => {
@@ -516,6 +526,30 @@ fn handle_agent_event(app: &mut App, event: AgentEvent) {
             app.push_tool_call(&name);
             app.buddy_react(buddy::BuddyEvent::ToolCall);
         }
+        AgentEvent::ToolResult { name: _, result, is_error } => {
+            // Show diff or error preview for file operations.
+            let preview = extract_tool_result_preview(&result, is_error);
+            if !preview.is_empty() {
+                app.push_tool_result(&preview);
+            }
+        }
+        AgentEvent::ThinkingChunk(chunk) => {
+            // Append to a thinking entry (collapsible in future).
+            match app.chat_history.last_mut() {
+                Some(e) if e.role == ChatRole::ToolResult && e.content.starts_with("[thinking] ") => {
+                    e.content.push_str(&chunk);
+                }
+                _ => {
+                    app.chat_history.push(crate::app::ChatEntry {
+                        role: ChatRole::ToolResult,
+                        content: format!("[thinking] {chunk}"),
+                    });
+                }
+            }
+            if !app.user_scrolled {
+                app.scroll_to_bottom();
+            }
+        }
         AgentEvent::Done { _tool_calls: _, usage } => {
             app.finish_response(&usage);
             app.buddy_react(buddy::BuddyEvent::Done);
@@ -822,6 +856,41 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
                 }
                 lines.push(Line::from(spans));
             }
+            ChatRole::ToolResult => {
+                if entry.content.starts_with("[thinking] ") {
+                    // Render thinking content in dim style.
+                    let thinking = &entry.content["[thinking] ".len()..];
+                    let preview: String = thinking.lines().take(5).collect::<Vec<_>>().join(" ");
+                    let truncated: String = preview.chars().take(120).collect();
+                    let dim = Style::default().fg(Color::Rgb(80, 80, 90)).italic();
+                    lines.push(Line::from(vec![
+                        Span::styled("  💭 ", dim),
+                        Span::styled(truncated, dim),
+                        if thinking.lines().count() > 5 { Span::styled(" …", dim) } else { Span::raw("") },
+                    ]));
+                } else {
+                    // Render diff with colors.
+                    for diff_line in entry.content.lines() {
+                        let style = if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
+                            Style::default().fg(Color::Rgb(80, 200, 80)) // green for additions
+                        } else if diff_line.starts_with('-') && !diff_line.starts_with("---") {
+                            Style::default().fg(Color::Rgb(200, 80, 80)) // red for removals
+                        } else if diff_line.starts_with("@@") {
+                            Style::default().fg(Color::Rgb(100, 150, 220)) // blue for hunk headers
+                        } else if diff_line.starts_with("---") || diff_line.starts_with("+++") {
+                            Style::default().fg(Color::Rgb(180, 180, 180)).bold()
+                        } else if diff_line.starts_with('⚠') {
+                            Style::default().fg(Color::Rgb(220, 160, 60)) // yellow for warnings
+                        } else {
+                            Style::default().fg(Color::Rgb(100, 100, 110)) // dim for context
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("    {diff_line}"),
+                            style,
+                        )));
+                    }
+                }
+            }
             ChatRole::System => {
                 for sys_line in entry.content.lines() {
                     lines.push(Line::from(Span::styled(
@@ -860,6 +929,32 @@ fn render_chat(frame: &mut Frame, area: Rect, app: &mut App) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, area, &mut scroll_state);
     }
+}
+
+/// Extract a displayable preview from a tool result.
+///
+/// For file_edit/file_write: extracts the unified diff portion.
+/// For errors: shows the error message.
+/// For other tools: returns empty (no preview needed).
+fn extract_tool_result_preview(result: &str, is_error: bool) -> String {
+    if is_error {
+        // Show short error preview.
+        let preview: String = result.lines().take(3).collect::<Vec<_>>().join("\n");
+        return format!("⚠ {preview}");
+    }
+    // Look for unified diff content.
+    if let Some(diff_start) = result.find("--- ") {
+        let diff = &result[diff_start..];
+        // Limit diff preview to 30 lines.
+        let lines: Vec<&str> = diff.lines().take(30).collect();
+        let truncated = lines.len() < diff.lines().count();
+        let mut out = lines.join("\n");
+        if truncated {
+            out.push_str("\n  … (diff truncated)");
+        }
+        return out;
+    }
+    String::new()
 }
 
 /// Extract a human-readable message from API error strings.

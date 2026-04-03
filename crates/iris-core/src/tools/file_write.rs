@@ -47,10 +47,22 @@ impl Tool for FileWriteTool {
             }
         }
 
+        // Read existing content for diff (empty if new file).
+        let old_content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+
         tokio::fs::write(&path, content)
             .await
             .with_context(|| format!("failed to write file {}", path.display()))?;
 
-        Ok(format!("Written {} bytes to {}", content.len(), path.display()))
+        let diff = crate::tools::file_edit::generate_unified_diff(
+            &path.display().to_string(),
+            &old_content,
+            content,
+        );
+        if diff.is_empty() {
+            Ok(format!("Written {} bytes to {} (unchanged)", content.len(), path.display()))
+        } else {
+            Ok(format!("Written {} bytes to {}\n\n{diff}", content.len(), path.display()))
+        }
     }
 }

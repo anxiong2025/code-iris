@@ -1,38 +1,50 @@
 //! Layered instructions loader — equivalent to Claude Code's CLAUDE.md.
 //!
-//! Loads `.iris/instructions.md` files from two locations (in order):
+//! Loads instructions from three levels (in order, all optional):
 //!
-//! 1. `~/.code-iris/instructions.md` — user-level, applied to every project
-//! 2. `<project_root>/.iris/instructions.md` — project-level
+//! 1. `~/.code-iris/instructions.md` — **global**, applied to every project
+//! 2. `<project_root>/.iris/instructions.md` — **project-level**
+//! 3. `<cwd>/.iris/instructions_local.md` — **directory-level** (for monorepos)
 //!
-//! Both files are optional. When both exist they are concatenated with a
-//! separator and prepended to the agent's system prompt.
-//!
-//! # Example `.iris/instructions.md`
-//!
-//! ```markdown
-//! You are working inside the `code-iris` Rust workspace.
-//!
-//! - Always run `cargo check` after editing `.rs` files.
-//! - Never commit directly to `main`; create a branch first.
-//! - Prefer `anyhow::Result` for error handling throughout.
-//! ```
+//! All existing files are concatenated with separators and prepended to
+//! the agent's system prompt.
 
 use std::path::Path;
 
 /// Load and merge layered instructions.
 ///
-/// Returns `None` when neither file exists or both are empty.
+/// - `project_root` is typically the git root or cwd.
+/// - `cwd` is the current working directory (may be a subdirectory of the project).
+///
+/// Returns `None` when no instruction files exist or all are empty.
 pub fn load(project_root: Option<&Path>) -> Option<String> {
+    load_with_cwd(project_root, None)
+}
+
+/// Load instructions with an explicit `cwd` for directory-level instructions.
+pub fn load_with_cwd(project_root: Option<&Path>, cwd: Option<&Path>) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
-    // User-level
+    // 1. Global — ~/.code-iris/instructions.md
     if let Some(home) = dirs::home_dir() {
         collect(home.join(".code-iris").join("instructions.md"), &mut parts);
     }
-    // Project-level
+    // 2. Project-level — <root>/.iris/instructions.md
     if let Some(root) = project_root {
         collect(root.join(".iris").join("instructions.md"), &mut parts);
+    }
+    // 3. Directory-level — <cwd>/.iris/instructions_local.md
+    // Only if cwd differs from project_root (avoids double-loading).
+    let effective_cwd = cwd.or(project_root);
+    if let Some(dir) = effective_cwd {
+        let local_path = dir.join(".iris").join("instructions_local.md");
+        if local_path.exists() {
+            // Avoid duplicating project-level instructions.
+            let is_project_root = project_root.map_or(false, |r| r == dir);
+            if !is_project_root || local_path != dir.join(".iris").join("instructions.md") {
+                collect(local_path, &mut parts);
+            }
+        }
     }
 
     if parts.is_empty() {

@@ -4,6 +4,32 @@ code-iris 的所有重要变更记录在此文件中。
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.4.1] — 2026-04-03
+
+### 改进
+- **Token 用量优化** — `max_tool_result_tokens` 从 8k 降至 4k，`keep_recent_turns` 从 6 降至 4，autocompact 阈值从 80% 提前到 60%
+- **旧工具结果驱逐 (L1.5)** — 每轮主动将超过 N 轮的旧 tool_result 替换为一行摘要，避免历史堆积
+- **Head+Tail 截断** — 工具结果截断时保留头部 75% + 尾部 25%，不丢失末尾的错误信息或关键输出
+
+## [0.4.0] — 2026-04-03
+
+### 新增
+- **Diff 预览** — `file_edit` 和 `file_write` 执行后在 TUI 展示红绿着色的 unified diff，看清每一行改动
+- **Extended Thinking 展示** — Claude 模型的 thinking 推理过程以折叠的 💭 形式显示在 TUI 中
+- **`/init` 项目扫描** — 自动检测语言/框架/构建命令/目录结构，生成 `.iris/instructions.md` 项目画像
+- **Skills 系统** — 内置 `/review`（代码审查）、`/doc`（文档生成）技能，支持自定义 `.iris/skills/*.md` 模板
+- **MCP 独立工具注册** — 每个 MCP server 的 tool 展开为独立注册（`mcp__server__tool`），LLM 可精准调用带独立 schema
+- **项目级 MCP 配置** — 支持 `.iris/mcp.toml`，项目级覆盖全局同名 server
+- **Streaming Tool Call** — 工具名在 SSE 流中立即显示（`ToolUseStart` 事件），不再等待完整 JSON
+- **三层记忆系统** — 全局 `~/.code-iris/instructions.md` → 项目 `.iris/instructions.md` → 目录 `.iris/instructions_local.md`
+- **Permission 精细化** — 支持 `.iris/permissions.toml` 按 tool 和路径 glob 配置 allow/confirm/deny 规则
+- **`/skills` 命令** — 列出所有可用技能（内置 + 自定义）
+- **`/memory` 增强** — 显示三层指令文件的加载状态
+
+### 改进
+- **Tool 执行结果回显** — `on_tool_result` 回调让 TUI 和 CLI 展示工具执行结果预览
+- **MCP 启动时发现** — 替代旧的懒加载单 wrapper 模式，启动时 `tools/list` 获取所有工具定义
+
 ## [0.3.1] — 2026-04-03
 
 ### 改进

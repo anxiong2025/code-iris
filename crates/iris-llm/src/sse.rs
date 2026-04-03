@@ -65,6 +65,10 @@ pub fn parse_anthropic_sse(response: Response) -> impl Stream<Item = Result<Stre
                         if t == "tool_use" {
                             let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                             let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            // Emit ToolUseStart immediately so TUI can show tool name.
+                            if !name.is_empty() {
+                                yield Ok(StreamEvent::ToolUseStart { name: name.clone() });
+                            }
                             tool_accum = Some(ToolAccum { id, name, json_buf: String::new() });
                         }
                     }
@@ -218,6 +222,7 @@ pub fn parse_openai_sse(response: Response) -> impl Stream<Item = Result<StreamE
                                 if let Some(name) = tc.pointer("/function/name").and_then(|n| n.as_str()) {
                                     if !name.is_empty() && tool_accums[idx].name.is_empty() {
                                         tool_accums[idx].name = name.to_string();
+                                        yield Ok(StreamEvent::ToolUseStart { name: name.to_string() });
                                     }
                                 }
                                 if let Some(args) = tc.pointer("/function/arguments").and_then(|a| a.as_str()) {

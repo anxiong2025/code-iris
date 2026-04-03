@@ -72,6 +72,9 @@ impl Message {
 pub enum StreamEvent {
     TextDelta { text: String },
     ThinkingDelta { thinking: String },
+    /// Emitted immediately when a tool call starts (name known, input still streaming).
+    ToolUseStart { name: String },
+    /// Emitted when a tool call is complete (id + name + full parsed input).
     ToolUse { id: String, name: String, input: Value },
     Usage(TokenUsage),
     MessageStop,

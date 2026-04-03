@@ -186,7 +186,7 @@ impl Coordinator {
     /// If `task.agent_type` is set, loads the [`AgentDefinition`] and applies its
     /// model and permissions — but the coordinator's `ceiling` always wins when more
     /// restrictive (e.g. a `Full` agent in a `Plan`-mode coordinator runs as `Plan`).
-    fn make_agent(
+    async fn make_agent(
         auth: &CoordAuth,
         default_model: &str,
         task: &SubTask,
@@ -223,7 +223,7 @@ impl Coordinator {
 
         let mut agent = match auth {
             CoordAuth::ApiKey(key) => Agent::new(key)?,
-            CoordAuth::FromEnv => Agent::from_env()?,
+            CoordAuth::FromEnv => Agent::from_env().await?,
         };
         agent = agent
             .with_model(model)
@@ -262,7 +262,7 @@ impl Coordinator {
                     tokio::spawn(async move {
                         let mut agent = Self::make_agent(
                             &auth, &model, &task, bus, agent_id, ceiling,
-                        )?;
+                        ).await?;
                         let response = agent.chat(&task.prompt).await?;
                         Ok(SubResult { label: task.label, response })
                     })
@@ -297,7 +297,7 @@ impl Coordinator {
 
         let mut synth_agent = match &self.auth {
             CoordAuth::ApiKey(key) => Agent::new(key)?,
-            CoordAuth::FromEnv => Agent::from_env()?,
+            CoordAuth::FromEnv => Agent::from_env().await?,
         };
         synth_agent = synth_agent
             .with_model(&self.model)
@@ -383,7 +383,7 @@ impl Coordinator {
 
             let mut agent = match &self.auth {
                 CoordAuth::ApiKey(key) => Agent::new(key)?,
-                CoordAuth::FromEnv => Agent::from_env()?,
+                CoordAuth::FromEnv => Agent::from_env().await?,
             };
             agent = agent
                 .with_model(model)
