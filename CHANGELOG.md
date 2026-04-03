@@ -4,6 +4,13 @@ code-iris 的所有重要变更记录在此文件中。
 
 格式遵循 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [0.3.1] — 2026-04-03
+
+### 改进
+- **web_fetch 重构** — Jina Reader (`r.jina.ai`) 做主抓取，返回干净 Markdown，支持 JS 渲染页面，raw reqwest 作为 fallback
+- **web_fetch prompt 参数** — 可指定要从页面提取的内容，大页面按 Markdown 标题分段 + 关键词匹配智能提取相关章节
+- **web_fetch 15 分钟缓存** — 同 URL 不重复抓取，自动清理过期条目
+
 ## [0.3.0] — 2026-04-03
 
 ### 新增

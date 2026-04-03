@@ -126,7 +126,7 @@ impl ToolRegistry {
         r.register(Arc::new(GrepTool::new(cwd.clone())));
         r.register(Arc::new(GlobTool::new(cwd.clone())));
         r.register(Arc::new(LspTool::new(cwd)));
-        r.register(Arc::new(WebFetchTool));
+        r.register(Arc::new(WebFetchTool::new()));
         r.register(Arc::new(WebSearchTool));
         r.register(Arc::new(TaskCreateTool(store.clone())));
         r.register(Arc::new(TaskUpdateTool(store.clone())));
@@ -155,7 +155,7 @@ impl ToolRegistry {
         r.register(Arc::new(GrepTool::new(cwd.clone())));
         r.register(Arc::new(GlobTool::new(cwd.clone())));
         r.register(Arc::new(LspTool::new(cwd)));
-        r.register(Arc::new(WebFetchTool));
+        r.register(Arc::new(WebFetchTool::new()));
         r.register(Arc::new(WebSearchTool));
         r.register(Arc::new(TaskCreateTool(store.clone())));
         r.register(Arc::new(TaskUpdateTool(store.clone())));
